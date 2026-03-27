@@ -5,12 +5,25 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import text
 
 from forecast import compute_forecast_from_db
-from forecast_dynamic import compute_forecast_dynamic_from_tables, latest_data_date
-from core.calving_facts import actual_birth_stats_from_tables, is_calving_month_complete_from_tables
+from forecast_dynamic import (
+    compute_forecast_debug_from_tables,
+    compute_forecast_dynamic_from_tables,
+    latest_data_date,
+)
+from core.backtesting import (
+    actual_metric_month_from_db,
+    actual_metric_month_from_tables,
+    backtest_percent_error,
+    collect_recent_target_months,
+    is_fact_month_complete_from_db,
+    month_end_shift,
+    pred_metric_value,
+    target_fact_month_complete_from_tables,
+)
 from core.constants import INDICATORS, OVERFLOW_COLS, OVERFLOW_GROUP_COLS, INDICATOR_TO_OVERFLOW
+# from core.data_quality import subdivision_data_quality_report
 from core.helpers import month_end, iter_month_ends, ensure_month_col, get_max_event_date_from_db, norm_label, vals_get
 from core.params import (
     apply_admin_overrides,
@@ -30,8 +43,8 @@ from ui.tab3_farm import (
     _prepare_capacity_editor_df_for_subdivision,
     _render_subdivision_capacity_editor_block,
     _subdivision_status_df_from_db,
+    TAB3_TABLES,
 )
-from ui.tab3_farm_parts.compute import _actual_nonbirth_snapshot_from_tables
 
 from etl.bulls import read_bulls_txt, load_bulls_to_db
 from etl.calvings_births import read_calvings_excel, load_calvings_to_db
@@ -70,146 +83,18 @@ BIRTH_BACKTEST_TARGETS = {
     "Ожидаемые тёлочки",
 }
 
+TAB1_UI_STATE_VERSION = "2026-03-24.v14"
 
-def _backtest_percent_error(pred_val: float, fact_val: float, *, is_pct: bool) -> float | None:
-    err_abs = abs(float(pred_val) - float(fact_val))
-    if is_pct:
-        return (err_abs / abs(float(fact_val)) * 100.0) if abs(float(fact_val)) > 1e-9 else None
-    scale = abs(float(pred_val)) + abs(float(fact_val))
-    if scale < 20.0:
-        return None
-    return 200.0 * err_abs / scale
-
-
-def _norm_sex_marker(x: Any) -> str | None:
-    if x is None:
-        return None
-    v = str(x).strip().upper().replace("Ё", "Е")
-    if v in {"", "NAN", "NONE", "NULL"}:
-        return None
-    if v in {"M", "М", "MALE", "1", "БЫК", "БЫЧ", "БЫЧОК"}:
-        return "M"
-    if v in {"F", "Ж", "FEMALE", "2", "ТЕЛКА", "ТЕЛОЧКА"}:
-        return "F"
-    return None
-
-
-def _actual_birth_stats_month(month_end_date: date) -> dict[str, float]:
-    m_start = date(month_end_date.year, month_end_date.month, 1)
-    if month_end_date.month == 12:
-        m_next = date(month_end_date.year + 1, 1, 1)
-    else:
-        m_next = date(month_end_date.year, month_end_date.month + 1, 1)
-
-    calv_sql = """
-    SELECT reg, mother_reg, birth_date, sex, event_type, event_date, lact
-    FROM calvings_births_raw
-    WHERE event_date IS NOT NULL
-      AND event_date::date >= :m_start
-      AND event_date::date < :m_next
-    """
-    ins_sql = """
-    SELECT reg, lact, event_date
-    FROM inseminations_raw
-    WHERE event_date IS NOT NULL
-      AND event_date::date <= :m_end
-    """
-    calv_df = pd.read_sql(text(calv_sql), con=engine, params={"m_start": m_start, "m_next": m_next})
-    if calv_df.empty:
-        return {k: 0.0 for k in BACKTEST_BIRTH_TARGETS}
-    ins_df = pd.read_sql(text(ins_sql), con=engine, params={"m_end": month_end_date})
-    return actual_birth_stats_from_tables(calv_df, ins_df, month_end_date, as_of_date=None)
-
-
-def _actual_metric_month(month_end_date: date, metric_name: str) -> float:
-    return float(_actual_birth_stats_month(month_end_date).get(metric_name, 0.0))
-
-
-def _is_birth_event_type_series(s: pd.Series) -> pd.Series:
-    ev = s.astype("string").fillna("").str.upper().str.replace("Ё", "Е", regex=False)
-    return ev.str.contains("РОЖ|BORN|BIRTH", regex=True, na=False)
-
-
-def _actual_birth_stats_month_from_tables(
-    calv_df: pd.DataFrame,
-    ins_df: pd.DataFrame | None,
-    month_end_date: date,
-    as_of_date: date | None = None,
-) -> dict[str, float]:
-    return actual_birth_stats_from_tables(calv_df, ins_df, month_end_date, as_of_date=as_of_date)
-
-
-def _actual_metric_month_from_tables(
-    calv_df: pd.DataFrame,
-    ins_df: pd.DataFrame | None,
-    dry_df: pd.DataFrame | None,
-    disp_df: pd.DataFrame | None,
-    month_end_date: date,
-    metric_name: str,
-) -> float:
-    if metric_name in BIRTH_BACKTEST_TARGETS or metric_name in PERCENT_TARGETS:
-        return float(_actual_birth_stats_month_from_tables(calv_df, ins_df, month_end_date).get(metric_name, 0.0))
-    snapshot = _actual_nonbirth_snapshot_from_tables(
-        calv_df,
-        ins_df if isinstance(ins_df, pd.DataFrame) else pd.DataFrame(),
-        dry_df if isinstance(dry_df, pd.DataFrame) else pd.DataFrame(),
-        disp_df if isinstance(disp_df, pd.DataFrame) else pd.DataFrame(),
-        month_end_date,
-    )
-    return float(snapshot.get(metric_name, 0.0))
-
-
-def _pred_metric_value(pred_vals: dict, metric_name: str, nmap: dict[str, float]) -> float:
-    if metric_name in PERCENT_TARGETS:
-        pred_bull = float(vals_get(pred_vals, "Ожидаемые бычки", nmap) or 0.0)
-        pred_heif = float(vals_get(pred_vals, "Ожидаемые тёлочки", nmap) or 0.0)
-        den = pred_bull + pred_heif
-        if den <= 0:
-            return 0.0
-        if metric_name == "Доля бычков среди рождений, %":
-            return pred_bull / den * 100.0
-        return pred_heif / den * 100.0
-    return float(vals_get(pred_vals, metric_name, nmap) or 0.0)
-
-
-def _is_fact_month_complete(month_end_date: date) -> bool:
-    m_start = date(month_end_date.year, month_end_date.month, 1)
-    if month_end_date.month == 12:
-        m_next = date(month_end_date.year + 1, 1, 1)
-    else:
-        m_next = date(month_end_date.year, month_end_date.month + 1, 1)
-
-    sql = """
-    SELECT reg, mother_reg, birth_date, sex, event_type, event_date, lact
-    FROM calvings_births_raw
-    WHERE event_date IS NOT NULL
-      AND event_date::date >= :m_start
-      AND event_date::date < :m_next
-    """
-    df = pd.read_sql(text(sql), con=engine, params={"m_start": m_start, "m_next": m_next})
-    return is_calving_month_complete_from_tables(df, month_end_date)
-
-
-def _is_fact_month_complete_from_tables(calv_df: pd.DataFrame, month_end_date: date) -> bool:
-    return is_calving_month_complete_from_tables(calv_df, month_end_date)
-
-
-def _is_target_fact_month_complete_from_tables(
-    tables: dict[str, pd.DataFrame],
-    metric_name: str,
-    month_end_date: date,
-) -> bool:
-    if metric_name in BIRTH_BACKTEST_TARGETS or metric_name in PERCENT_TARGETS:
-        return is_calving_month_complete_from_tables(tables.get("calv", pd.DataFrame()), month_end_date)
-    try:
-        return bool(latest_data_date(tables) >= month_end_date)
-    except Exception:
-        return False
-
-
-def _month_end_shift(d_end: date, months_delta: int) -> date:
-    ts = pd.Timestamp(d_end) + pd.DateOffset(months=months_delta)
-    return month_end(int(ts.year), int(ts.month))
+BACKTEST_DEBUG_TARGETS = {
+    "Дойные коровы",
+    "Сухостойные коровы",
+    "Нетели",
+    "Тёлки ≥9 мес",
+    "Тёлки 3–8 мес",
+    "Тёлки 0–3 мес",
+    "Тёлки 0–2 мес",
+    "Бычки 0–2 мес",
+}
 
 
 def _rewind_fileobj(file_obj: Any) -> None:
@@ -372,6 +257,11 @@ def _clear_tab1_outputs_state() -> None:
         "last_excel_bytes",
         "backtest_df",
         "backtest_cfg",
+        "backtest_debug_df",
+        "backtest_debug_error",
+        "subdivision_quality_report",
+        "subdivision_quality_report_key",
+        "subdivision_quality_report_error",
     ):
         st.session_state.pop(k, None)
 
@@ -417,7 +307,81 @@ def _render_tab1_subdivision_capacity_panel(subdivision_name: str) -> None:
     st.dataframe(view_df, use_container_width=True, hide_index=True)
 
 
+def _render_tab1_subdivision_quality_panel(
+    subdivision_name: str,
+    subdivision_last_data_date: date | None,
+) -> None:
+    sub = str(subdivision_name or "").strip()
+    if not sub:
+        return
+
+    with st.expander("Диагностика качества данных подразделения", expanded=False):
+        report_key = (sub, str(subdivision_last_data_date or ""))
+        cached_key = st.session_state.get("subdivision_quality_report_key")
+        if cached_key != report_key:
+            try:
+                tables = _load_farm_tables_from_db(sub)
+                report = subdivision_data_quality_report(
+                    sub,
+                    tables,
+                    raw_table_names={k: TAB3_TABLES[k] for k in ("calv", "ins", "dry", "disp")},
+                    con=engine,
+                )
+                st.session_state["subdivision_quality_report"] = report
+                st.session_state["subdivision_quality_report_key"] = report_key
+                st.session_state.pop("subdivision_quality_report_error", None)
+            except Exception as e:
+                st.session_state["subdivision_quality_report"] = None
+                st.session_state["subdivision_quality_report_key"] = report_key
+                st.session_state["subdivision_quality_report_error"] = str(e)
+
+        err = st.session_state.get("subdivision_quality_report_error")
+        if err:
+            st.warning(f"Не удалось построить диагностику качества данных: {err}")
+            return
+
+        report = st.session_state.get("subdivision_quality_report")
+        if not isinstance(report, dict):
+            st.caption("Диагностика пока недоступна.")
+            return
+
+        summary = report.get("summary")
+        if isinstance(summary, pd.DataFrame) and not summary.empty:
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Сводка качества данных пуста.")
+
+        detail_sections = [
+            (
+                "incomplete_chain",
+                "Подтверждённые осеменения без видимого завершения",
+                "Старые подтверждённые осеменения, по которым в выбранном подразделении нет ни отёла, ни выбытия.",
+            ),
+            (
+                "first_seen_midcycle",
+                "Животные, впервые появляющиеся не с рождения",
+                "Эти животные начинают историю подразделения уже с осеменения, запуска, выбытия или отёла.",
+            ),
+            (
+                "cross_subdivision",
+                "Животные со событиями в нескольких подразделениях",
+                "Один и тот же reg встречается более чем в одном подразделении в raw-таблицах хозяйства.",
+            ),
+        ]
+        for key, title, empty_caption in detail_sections:
+            df = report.get(key)
+            with st.expander(title, expanded=False):
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                else:
+                    st.caption(empty_caption)
+
+
 def render_tab1_forecast() -> None:
+    if st.session_state.get("tab1_ui_state_version") != TAB1_UI_STATE_VERSION:
+        st.session_state["tab1_ui_state_version"] = TAB1_UI_STATE_VERSION
+        _clear_tab1_outputs_state()
+
     st.subheader("Источник данных")
     single_subdivision_mode = False
     selected_farm = ""
@@ -610,6 +574,13 @@ def render_tab1_forecast() -> None:
     st.caption(last_data_caption)
     if (not need_files) and db_subdivision_mode and (db_selected_subdivision or "").strip():
         _render_tab1_subdivision_capacity_panel(db_selected_subdivision)
+        # Временно скрыто из интерфейса.
+        # Если понадобится вернуть диагностику качества данных подразделения,
+        # нужно раскомментировать вызов ниже и импорт subdivision_data_quality_report выше.
+        # _render_tab1_subdivision_quality_panel(
+        #     db_selected_subdivision,
+        #     db_selected_last_data_date,
+        # )
     calculate = st.button("Рассчитать прогноз", key="btn_calc_forecast", use_container_width=True)
 
     st.session_state.setdefault("last_result_df", None)
@@ -619,6 +590,8 @@ def render_tab1_forecast() -> None:
     st.session_state.setdefault("last_realization_view", None)
     st.session_state.setdefault("backtest_df", None)
     st.session_state.setdefault("backtest_cfg", None)
+    st.session_state.setdefault("backtest_debug_df", None)
+    st.session_state.setdefault("backtest_debug_error", None)
 
     if calculate:
         if (not need_files) and not (db_selected_subdivision or "").strip():
@@ -885,7 +858,7 @@ def render_tab1_forecast() -> None:
                 "Горизонт (на сколько месяцев раньше ставим as-of)",
                 min_value=1,
                 max_value=6,
-                value=2,
+                value=4,
                 step=1,
                 key="bt_horizon",
             )
@@ -907,7 +880,29 @@ def render_tab1_forecast() -> None:
             else:
                 base_date_bt = get_max_event_date_from_db()
             last_me_bt = month_end(base_date_bt.year, base_date_bt.month)
-            target_months = [_month_end_shift(last_me_bt, -i) for i in range(bt_months - 1, -1, -1)]
+            if bt_complete_only:
+                if bt_use_subdivision_mode and bt_tables is not None:
+                    target_months = collect_recent_target_months(
+                        last_me_bt,
+                        bt_months,
+                        complete_checker=lambda d: target_fact_month_complete_from_tables(
+                            bt_tables,
+                            bt_target,
+                            d,
+                            birth_targets=BIRTH_BACKTEST_TARGETS,
+                            percent_targets=PERCENT_TARGETS,
+                        ),
+                        search_limit_months=max(24, int(bt_months) * 12),
+                    )
+                else:
+                    target_months = collect_recent_target_months(
+                        last_me_bt,
+                        bt_months,
+                        complete_checker=lambda d: is_fact_month_complete_from_db(engine, d),
+                        search_limit_months=max(24, int(bt_months) * 12),
+                    )
+            else:
+                target_months = [month_end_shift(last_me_bt, -i) for i in range(bt_months - 1, -1, -1)]
             unit = "pct" if bt_target in PERCENT_TARGETS else "heads"
             skipped_incomplete = 0
 
@@ -922,46 +917,68 @@ def render_tab1_forecast() -> None:
                 db_selected_subdivision if bt_use_subdivision_mode else None
             )
             bt_params = apply_admin_overrides(bt_base_params, runtime_overrides=bt_scoped_ov)
+            bt_pred_params = dict(bt_params)
+            if bt_use_subdivision_mode and bt_tables is not None:
+                bt_pred_params["DISABLE_CAPACITY"] = True
             rows_bt: list[dict] = []
+            rows_bt_debug: list[dict] = []
+            debug_supported = bool(bt_use_subdivision_mode and bt_target in BACKTEST_DEBUG_TARGETS)
+            debug_error: str | None = None
             prog_bt = st.progress(0.0)
 
             for i, target_me in enumerate(target_months, start=1):
                 if bt_use_subdivision_mode and bt_tables is not None:
-                    is_complete = _is_target_fact_month_complete_from_tables(bt_tables, bt_target, target_me)
+                    is_complete = target_fact_month_complete_from_tables(
+                        bt_tables,
+                        bt_target,
+                        target_me,
+                        birth_targets=BIRTH_BACKTEST_TARGETS,
+                        percent_targets=PERCENT_TARGETS,
+                    )
                 else:
-                    is_complete = _is_fact_month_complete(target_me)
+                    is_complete = is_fact_month_complete_from_db(engine, target_me)
                 if bt_complete_only and not is_complete:
                     skipped_incomplete += 1
                     prog_bt.progress(i / max(1, len(target_months)))
                     continue
 
-                as_of_me = _month_end_shift(target_me, -int(bt_horizon))
+                as_of_me = month_end_shift(target_me, -int(bt_horizon))
                 if bt_use_subdivision_mode and bt_tables is not None:
                     pred_vals = compute_forecast_dynamic_from_tables(
                         bt_tables,
                         target_me,
-                        overrides=bt_params,
+                        overrides=bt_pred_params,
                         as_of_date=as_of_me,
                     ) or {}
                 else:
                     pred_vals = compute_forecast_from_db(target_me, overrides=bt_params, as_of_date=as_of_me) or {}
                 nmap = {norm_label(k): v for k, v in pred_vals.items()}
-                pred_val = float(_pred_metric_value(pred_vals, bt_target, nmap))
+                pred_val = float(pred_metric_value(pred_vals, bt_target, nmap, percent_targets=PERCENT_TARGETS))
                 if bt_use_subdivision_mode and bt_tables is not None:
                     fact_val = float(
-                        _actual_metric_month_from_tables(
+                        actual_metric_month_from_tables(
                             bt_tables.get("calv", pd.DataFrame()),
                             bt_tables.get("ins", pd.DataFrame()),
                             bt_tables.get("dry", pd.DataFrame()),
                             bt_tables.get("disp", pd.DataFrame()),
                             target_me,
                             bt_target,
+                            birth_targets=BIRTH_BACKTEST_TARGETS,
+                            percent_targets=PERCENT_TARGETS,
                         )
                     )
                 else:
-                    fact_val = float(_actual_metric_month(target_me, bt_target))
+                    fact_val = float(
+                        actual_metric_month_from_db(
+                            engine,
+                            target_me,
+                            bt_target,
+                            birth_targets=BIRTH_BACKTEST_TARGETS,
+                            percent_targets=PERCENT_TARGETS,
+                        )
+                    )
                 err = pred_val - fact_val
-                ape = _backtest_percent_error(pred_val, fact_val, is_pct=(bt_target in PERCENT_TARGETS))
+                ape = backtest_percent_error(pred_val, fact_val, is_pct=(bt_target in PERCENT_TARGETS))
 
                 rows_bt.append(
                     {
@@ -975,12 +992,38 @@ def render_tab1_forecast() -> None:
                         "Полный месяц факта": bool(is_complete),
                     }
                 )
+                if debug_supported and bt_tables is not None:
+                    try:
+                        debug_vals = compute_forecast_debug_from_tables(
+                            bt_tables,
+                            target_me,
+                            bt_target,
+                            overrides=bt_pred_params,
+                            as_of_date=as_of_me,
+                        ) or {}
+                        rows_bt_debug.append(
+                            {
+                                "Месяц факта": target_me.strftime("%Y-%m"),
+                                "as-of (на дату)": as_of_me.strftime("%Y-%m"),
+                                "Показатель": bt_target,
+                                "Прогноз": round(pred_val, 1),
+                                "Факт": round(fact_val, 1),
+                                "Ошибка": round(err, 1),
+                                **debug_vals,
+                            }
+                        )
+                    except Exception as e:
+                        debug_supported = False
+                        debug_error = str(e)
                 prog_bt.progress(i / max(1, len(target_months)))
             prog_bt.empty()
 
             st.session_state["backtest_df"] = pd.DataFrame(rows_bt)
+            st.session_state["backtest_debug_df"] = pd.DataFrame(rows_bt_debug)
+            st.session_state["backtest_debug_error"] = debug_error
             st.session_state["backtest_cfg"] = {
                 "months": int(bt_months),
+                "months_found": int(len(target_months)),
                 "horizon": int(bt_horizon),
                 "metric": bt_target,
                 "unit": unit,
@@ -991,6 +1034,13 @@ def render_tab1_forecast() -> None:
 
         bt_df = st.session_state.get("backtest_df")
         bt_cfg = st.session_state.get("backtest_cfg") or {}
+        if isinstance(bt_df, pd.DataFrame) and bt_df.empty:
+            skipped = int(bt_cfg.get("skipped_incomplete", 0) or 0)
+            if skipped > 0 and str(bt_cfg.get("metric") or "") == "Нетели":
+                st.info(
+                    "Для метрики «Нетели» эти месяцы пропущены: по данному подразделению нет полного прямого контура факта, "
+                    "а окно будущих первых отёлов ещё не покрывает нужный горизонт."
+                )
         if isinstance(bt_df, pd.DataFrame) and not bt_df.empty:
             expected_scope = f"subdivision:{db_selected_subdivision}" if bt_use_subdivision_mode else "db:all"
             cfg_changed = (
@@ -1046,6 +1096,15 @@ def render_tab1_forecast() -> None:
                 st.dataframe(bt_df, use_container_width=True, hide_index=True)
                 chart_df = bt_df.set_index("Месяц факта")[["Прогноз", "Факт"]]
                 st.line_chart(chart_df)
+
+                debug_df = st.session_state.get("backtest_debug_df")
+                debug_err = st.session_state.get("backtest_debug_error")
+                if bt_use_subdivision_mode and bt_target in BACKTEST_DEBUG_TARGETS:
+                    if debug_err:
+                        st.warning(f"Не удалось построить детализацию симуляции: {debug_err}")
+                    elif isinstance(debug_df, pd.DataFrame) and not debug_df.empty:
+                        with st.expander("Детализация симуляции по месяцам", expanded=False):
+                            st.dataframe(debug_df, use_container_width=True, hide_index=True)
     if not isinstance(result, pd.DataFrame) or result.empty:
         st.info("Нажми «Рассчитать прогноз», чтобы увидеть таблицы.")
         return

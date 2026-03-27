@@ -12,7 +12,7 @@ from sqlalchemy import text
 from db import engine
 import model_params as mp
 
-PARAMS_CACHE_VERSION = "v3"
+PARAMS_CACHE_VERSION = "v12"
 
 
 def _get_db_signature() -> str:
@@ -184,6 +184,8 @@ def _runtime_params_to_dict(rp: Any) -> Dict[str, Any]:
         "DRY_DAYS": obj.get("dry_days"),
         "DISPOSAL_PARAMS": obj.get("disposal_params"),
         "ANNUAL_DISPOSAL_RATE": obj.get("annual_disposal_rate"),
+        "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE": obj.get("heifer_precalving_annual_disposal_rate"),
+        "BULL_CALF_DAILY_EXIT_RATE": obj.get("bull_calf_daily_exit_rate"),
         "INSEMINATION_PARAMS": obj.get("insemination_params"),
         "meta": obj.get("meta"),
     }
@@ -202,6 +204,8 @@ def compute_params_from_tables(tables: Dict[str, pd.DataFrame]) -> Dict[str, Any
         RuntimeParams,
         _compute_conception_params,
         _compute_disposal_params,
+        _compute_heifer_precalving_disposal_rate,
+        _compute_bull_calf_daily_exit_rate,
         _compute_dry_days,
         _compute_gestation_days,
         _compute_insemination_params,
@@ -212,7 +216,10 @@ def compute_params_from_tables(tables: Dict[str, pd.DataFrame]) -> Dict[str, Any
     dry = tables.get("dry", pd.DataFrame())
     disp = tables.get("disp", pd.DataFrame())
 
-    conception_params = _compute_conception_params(ins.copy() if isinstance(ins, pd.DataFrame) else pd.DataFrame())
+    conception_params = _compute_conception_params(
+        ins.copy() if isinstance(ins, pd.DataFrame) else pd.DataFrame(),
+        calv.copy() if isinstance(calv, pd.DataFrame) else pd.DataFrame(),
+    )
     gest, gest_meta = _compute_gestation_days(
         calv.copy() if isinstance(calv, pd.DataFrame) else pd.DataFrame(),
         ins.copy() if isinstance(ins, pd.DataFrame) else pd.DataFrame(),
@@ -222,6 +229,15 @@ def compute_params_from_tables(tables: Dict[str, pd.DataFrame]) -> Dict[str, Any
         dry.copy() if isinstance(dry, pd.DataFrame) else pd.DataFrame(),
     )
     disposal_params, annual_rate, disp_meta = _compute_disposal_params(
+        calv.copy() if isinstance(calv, pd.DataFrame) else pd.DataFrame(),
+        disp.copy() if isinstance(disp, pd.DataFrame) else pd.DataFrame(),
+    )
+    heifer_precalving_rate, heifer_disp_meta = _compute_heifer_precalving_disposal_rate(
+        calv.copy() if isinstance(calv, pd.DataFrame) else pd.DataFrame(),
+        disp.copy() if isinstance(disp, pd.DataFrame) else pd.DataFrame(),
+        ins.copy() if isinstance(ins, pd.DataFrame) else pd.DataFrame(),
+    )
+    bull_calf_exit_rate, bull_exit_meta = _compute_bull_calf_daily_exit_rate(
         calv.copy() if isinstance(calv, pd.DataFrame) else pd.DataFrame(),
         disp.copy() if isinstance(disp, pd.DataFrame) else pd.DataFrame(),
     )
@@ -236,8 +252,16 @@ def compute_params_from_tables(tables: Dict[str, pd.DataFrame]) -> Dict[str, Any
         dry_days=int(dry_days),
         disposal_params=disposal_params,
         annual_disposal_rate=float(annual_rate),
+        heifer_precalving_annual_disposal_rate=float(heifer_precalving_rate),
+        bull_calf_daily_exit_rate=float(bull_calf_exit_rate),
         insemination_params=insemination_params,
-        meta={"gestation": gest_meta, "dry": dry_meta, "disposal": disp_meta},
+        meta={
+            "gestation": gest_meta,
+            "dry": dry_meta,
+            "disposal": disp_meta,
+            "heifer_precalving_disposal": heifer_disp_meta,
+            "bull_calf_exit": bull_exit_meta,
+        },
     )
     return _runtime_params_to_dict(rp)
 
@@ -274,13 +298,19 @@ def get_param_source() -> Dict[str, Any]:
         "dry_days": int(getattr(mp, "DRY_DAYS", 53)),
         "disposal_params": dict(mp.DISPOSAL_PARAMS),
         "annual_disposal_rate": float(getattr(mp, "ANNUAL_DISPOSAL_RATE", 0.0957)),
+        "heifer_precalving_annual_disposal_rate": float(
+            getattr(mp, "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE", getattr(mp, "ANNUAL_DISPOSAL_RATE", 0.0957))
+        ),
+        "bull_calf_daily_exit_rate": float(getattr(mp, "BULL_CALF_DAILY_EXIT_RATE", 0.0)),
         "insemination_params": {
             "cow_services_per_conception": float(mp.INSEMINATION_PARAMS.cow_services_per_conception),
             "cow_ai_interval_days": float(mp.INSEMINATION_PARAMS.cow_ai_interval_days),
+            "cow_pregnancy_loss_rate": float(mp.INSEMINATION_PARAMS.cow_pregnancy_loss_rate),
             "cow_first_ai_dim_by_lact": dict(mp.INSEMINATION_PARAMS.cow_first_ai_dim_by_lact),
             "cow_conception_month_factors": dict(mp.INSEMINATION_PARAMS.cow_conception_month_factors),
             "heifer_services_per_conception": float(mp.INSEMINATION_PARAMS.heifer_services_per_conception),
             "heifer_ai_interval_days": float(mp.INSEMINATION_PARAMS.heifer_ai_interval_days),
+            "heifer_pregnancy_loss_rate": float(mp.INSEMINATION_PARAMS.heifer_pregnancy_loss_rate),
             "heifer_first_ai_age_days": float(mp.INSEMINATION_PARAMS.heifer_first_ai_age_days),
             "heifer_conception_month_factors": dict(mp.INSEMINATION_PARAMS.heifer_conception_month_factors),
         },
@@ -316,13 +346,19 @@ def get_model_default_params() -> Dict[str, Any]:
         "dry_days": int(getattr(mp, "DRY_DAYS", 53)),
         "disposal_params": dict(mp.DISPOSAL_PARAMS),
         "annual_disposal_rate": float(getattr(mp, "ANNUAL_DISPOSAL_RATE", 0.0957)),
+        "heifer_precalving_annual_disposal_rate": float(
+            getattr(mp, "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE", getattr(mp, "ANNUAL_DISPOSAL_RATE", 0.0957))
+        ),
+        "bull_calf_daily_exit_rate": float(getattr(mp, "BULL_CALF_DAILY_EXIT_RATE", 0.0)),
         "insemination_params": {
             "cow_services_per_conception": float(mp.INSEMINATION_PARAMS.cow_services_per_conception),
             "cow_ai_interval_days": float(mp.INSEMINATION_PARAMS.cow_ai_interval_days),
+            "cow_pregnancy_loss_rate": float(mp.INSEMINATION_PARAMS.cow_pregnancy_loss_rate),
             "cow_first_ai_dim_by_lact": dict(mp.INSEMINATION_PARAMS.cow_first_ai_dim_by_lact),
             "cow_conception_month_factors": dict(mp.INSEMINATION_PARAMS.cow_conception_month_factors),
             "heifer_services_per_conception": float(mp.INSEMINATION_PARAMS.heifer_services_per_conception),
             "heifer_ai_interval_days": float(mp.INSEMINATION_PARAMS.heifer_ai_interval_days),
+            "heifer_pregnancy_loss_rate": float(mp.INSEMINATION_PARAMS.heifer_pregnancy_loss_rate),
             "heifer_first_ai_age_days": float(mp.INSEMINATION_PARAMS.heifer_first_ai_age_days),
             "heifer_conception_month_factors": dict(mp.INSEMINATION_PARAMS.heifer_conception_month_factors),
         },
@@ -390,6 +426,8 @@ def _normalize_param_aliases(params: Optional[Dict[str, Any]]) -> Dict[str, Any]
         ("conception", "CONCEPTION_PARAMS"),
         ("disposal_params", "DISPOSAL_PARAMS"),
         ("annual_disposal_rate", "ANNUAL_DISPOSAL_RATE"),
+        ("heifer_precalving_annual_disposal_rate", "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE"),
+        ("bull_calf_daily_exit_rate", "BULL_CALF_DAILY_EXIT_RATE"),
         ("insemination_params", "INSEMINATION_PARAMS"),
         ("semen_usage", "SEMEN_USAGE_SHARES"),
         ("semen_sex_ratios", "SEMEN_SEX_RATIOS"),

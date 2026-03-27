@@ -74,10 +74,10 @@ def _prepare_calving_rows(
     calv_df: pd.DataFrame,
     month_end_date: date,
     as_of_date: date | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if not isinstance(calv_df, pd.DataFrame) or calv_df.empty:
         empty = pd.DataFrame()
-        return empty, empty, empty
+        return empty, empty, empty, empty
 
     m_start, m_next = _month_bounds(month_end_date)
     as_of_ts = None if as_of_date is None else pd.Timestamp(as_of_date).normalize()
@@ -96,17 +96,20 @@ def _prepare_calving_rows(
     c.loc[born_mask, "fact_dt_n"] = c.loc[born_mask, "birth_date_n"]
 
     calving_like = c["event_type_n"].isin(["ОТЕЛ", "РОЖДЕН"])
-    scoped = c[
+    all_scoped = c[
         calving_like
         & c["fact_dt_n"].notna()
-        & (c["fact_dt_n"] >= pd.Timestamp(m_start))
-        & (c["fact_dt_n"] < pd.Timestamp(m_next))
+    ].copy()
+
+    scoped = all_scoped[
+        (all_scoped["fact_dt_n"] >= pd.Timestamp(m_start))
+        & (all_scoped["fact_dt_n"] < pd.Timestamp(m_next))
     ].copy()
     if as_of_ts is not None:
         scoped = scoped.loc[scoped["fact_dt_n"] <= as_of_ts].copy()
     if scoped.empty:
         empty = pd.DataFrame()
-        return empty, empty, empty
+        return empty, empty, empty, empty
 
     born = scoped.loc[scoped["event_type_n"] == "РОЖДЕН"].copy()
     otel = scoped.loc[scoped["event_type_n"] == "ОТЕЛ"].copy()
@@ -124,7 +127,7 @@ def _prepare_calving_rows(
     events = pd.concat([otel_events, born_events], ignore_index=True)
     if events.empty:
         empty = pd.DataFrame()
-        return scoped, born, empty
+        return scoped, born, empty, empty
 
     missing = events["cow_reg_s"].astype(str).str.strip() == ""
     if bool(missing.any()):
@@ -137,7 +140,26 @@ def _prepare_calving_rows(
         kind="mergesort",
     )
     events = events.drop_duplicates(subset=["cow_reg_s", "calv_dt"], keep="first").copy()
-    return scoped, born, events
+
+    all_born = all_scoped.loc[all_scoped["event_type_n"] == "РОЖДЕН"].copy()
+    all_otel = all_scoped.loc[all_scoped["event_type_n"] == "ОТЕЛ"].copy()
+    all_born_events = all_born[["mother_reg_s", "fact_dt_n"]].rename(
+        columns={"mother_reg_s": "cow_reg_s", "fact_dt_n": "calv_dt"}
+    )
+    all_otel_events = all_otel[["reg_s", "fact_dt_n"]].rename(
+        columns={"reg_s": "cow_reg_s", "fact_dt_n": "calv_dt"}
+    )
+    all_events = pd.concat([all_otel_events, all_born_events], ignore_index=True)
+    if not all_events.empty:
+        miss = all_events["cow_reg_s"].astype(str).str.strip() == ""
+        if bool(miss.any()):
+            all_events.loc[miss, "cow_reg_s"] = [f"__UNK__ALL__{i}" for i in range(int(miss.sum()))]
+        all_events = (
+            all_events.sort_values(["cow_reg_s", "calv_dt"], kind="mergesort")
+            .drop_duplicates(subset=["cow_reg_s", "calv_dt"], keep="first")
+            .copy()
+        )
+    return scoped, born, events, all_events
 
 
 def actual_birth_stats_from_tables(
@@ -146,7 +168,7 @@ def actual_birth_stats_from_tables(
     month_end_date: date,
     as_of_date: date | None = None,
 ) -> dict[str, float]:
-    scoped, born, events = _prepare_calving_rows(calv_df, month_end_date, as_of_date=as_of_date)
+    scoped, born, events, all_events = _prepare_calving_rows(calv_df, month_end_date, as_of_date=as_of_date)
     if events.empty:
         return _empty_birth_stats()
 
@@ -183,6 +205,19 @@ def actual_birth_stats_from_tables(
             except Exception:
                 pass
 
+    if isinstance(all_events, pd.DataFrame) and not all_events.empty:
+        first_calv = (
+            all_events.sort_values(["cow_reg_s", "calv_dt"], kind="mergesort")
+            .drop_duplicates(subset=["cow_reg_s"], keep="first")
+            .rename(columns={"calv_dt": "first_calv_dt"})
+        )
+        events = events.merge(first_calv[["cow_reg_s", "first_calv_dt"]], on="cow_reg_s", how="left")
+        first_mask = (
+            events["first_calv_dt"].notna()
+            & (pd.to_datetime(events["calv_dt"], errors="coerce") == pd.to_datetime(events["first_calv_dt"], errors="coerce"))
+        )
+        events.loc[first_mask & events["lact_eff"].isna(), "lact_eff"] = 0
+
     lact_eff = pd.to_numeric(events["lact_eff"], errors="coerce")
     heif_calv = float((lact_eff <= 0).sum())
     cow_calv = float(((lact_eff > 0) | lact_eff.isna()).sum())
@@ -217,7 +252,7 @@ def actual_birth_stats_from_tables(
 
 
 def is_calving_month_complete_from_tables(calv_df: pd.DataFrame, month_end_date: date) -> bool:
-    scoped, _, _ = _prepare_calving_rows(calv_df, month_end_date, as_of_date=None)
+    scoped, _, _, _ = _prepare_calving_rows(calv_df, month_end_date, as_of_date=None)
     if scoped.empty:
         return False
     max_dt = pd.to_datetime(scoped["fact_dt_n"], errors="coerce").max()

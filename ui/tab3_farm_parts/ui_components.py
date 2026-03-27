@@ -19,6 +19,19 @@ from .common import *
 from .storage import *
 from .compute import *
 
+SEASON_ORDER = [
+    ("winter", "Зима"),
+    ("spring", "Весна"),
+    ("summer", "Лето"),
+    ("autumn", "Осень"),
+]
+SEASON_MONTHS = {
+    "winter": (12, 1, 2),
+    "spring": (3, 4, 5),
+    "summer": (6, 7, 8),
+    "autumn": (9, 10, 11),
+}
+
 
 def _tab3_percent_metric_from_backtest_rows(bt_df: pd.DataFrame, *, is_pct: bool) -> float | None:
     if not isinstance(bt_df, pd.DataFrame) or bt_df.empty:
@@ -69,6 +82,34 @@ def _set_nested_param(d: dict, path: list[Any], value: Any) -> None:
     if isinstance(cur, dict) and isinstance(leaf, int) and str(leaf) in cur and leaf not in cur:
         leaf = str(leaf)
     cur[leaf] = value
+
+
+def _seasonal_conception_values_from_params(params: dict | None) -> dict[str, dict[str, float]]:
+    ip = _get_nested_param(params, ["INSEMINATION_PARAMS"], None) if isinstance(params, dict) else None
+    if not isinstance(ip, dict):
+        ip = {}
+
+    out: dict[str, dict[str, float]] = {"cow": {}, "heifer": {}}
+    for animal_key in ("cow", "heifer"):
+        season_raw = _get_nested_param(ip, [f"{animal_key}_conception_season_factors"], None)
+        month_raw = _get_nested_param(ip, [f"{animal_key}_conception_month_factors"], None)
+        for season, _label in SEASON_ORDER:
+            value: float | None = None
+            if isinstance(season_raw, dict):
+                raw = _get_nested_param(season_raw, [season], None)
+                num = pd.to_numeric(raw, errors="coerce")
+                if not pd.isna(num):
+                    value = float(num)
+            if value is None and isinstance(month_raw, dict):
+                vals = []
+                for month in SEASON_MONTHS[season]:
+                    num = pd.to_numeric(_get_nested_param(month_raw, [month], None), errors="coerce")
+                    if not pd.isna(num):
+                        vals.append(float(num))
+                if vals:
+                    value = float(sum(vals) / len(vals))
+            out[animal_key][season] = float(1.0 if value is None else value)
+    return out
 
 
 def _render_param_inputs(key_prefix: str, source_params: dict, fallback_params: dict) -> dict[str, Any]:
@@ -285,6 +326,37 @@ def _render_param_inputs(key_prefix: str, source_params: dict, fallback_params: 
             key=f"{key_prefix}_ins_first_l4",
         )
 
+    season_values = _seasonal_conception_values_from_params(source_params)
+    with st.expander("Сезонные коэффициенты зачатия", expanded=False):
+        st.caption("Коэффициенты применяются ко всем месяцам сезона.")
+        s_cols = st.columns(4)
+        season_inputs: dict[str, dict[str, float]] = {"cow": {}, "heifer": {}}
+        for idx, (season, label) in enumerate(SEASON_ORDER):
+            with s_cols[idx]:
+                st.markdown(f"**{label}**")
+                season_inputs["cow"][season] = float(
+                    _num_input(
+                        "Коровы",
+                        min_value=0.75,
+                        max_value=1.25,
+                        value=float(season_values["cow"][season]),
+                        step=0.01,
+                        key=f"{key_prefix}_season_cow_{season}",
+                        format="%.3f",
+                    )
+                )
+                season_inputs["heifer"][season] = float(
+                    _num_input(
+                        "Тёлки",
+                        min_value=0.75,
+                        max_value=1.25,
+                        value=float(season_values["heifer"][season]),
+                        step=0.01,
+                        key=f"{key_prefix}_season_heifer_{season}",
+                        format="%.3f",
+                    )
+                )
+
     st.markdown("**Семя**")
     c_sem_1, c_sem_2 = st.columns(2)
     with c_sem_1:
@@ -425,6 +497,17 @@ def _render_param_inputs(key_prefix: str, source_params: dict, fallback_params: 
     _set_nested_param(new_override, ["INSEMINATION_PARAMS", "cow_first_ai_dim_by_lact", 2], float(cow_first_ai_l2))
     _set_nested_param(new_override, ["INSEMINATION_PARAMS", "cow_first_ai_dim_by_lact", 3], float(cow_first_ai_l3))
     _set_nested_param(new_override, ["INSEMINATION_PARAMS", "cow_first_ai_dim_by_lact", 4], float(cow_first_ai_l4))
+    for season, _label in SEASON_ORDER:
+        _set_nested_param(
+            new_override,
+            ["INSEMINATION_PARAMS", "cow_conception_season_factors", season],
+            float(season_inputs["cow"][season]),
+        )
+        _set_nested_param(
+            new_override,
+            ["INSEMINATION_PARAMS", "heifer_conception_season_factors", season],
+            float(season_inputs["heifer"][season]),
+        )
     _set_nested_param(new_override, ["SEMEN_USAGE_SHARES", "cow_sex"], float(cow_sex_share))
     _set_nested_param(new_override, ["SEMEN_USAGE_SHARES", "cow_trad"], float(max(0.0, 1.0 - float(cow_sex_share))))
     _set_nested_param(new_override, ["SEMEN_USAGE_SHARES", "heifer_sex"], float(heifer_sex_share))
@@ -633,16 +716,6 @@ def _capacity_overrides_for_farm(farm_name: str) -> dict[str, dict]:
             "DISABLE_CAPACITY": False,
         }
     return out
-
-
-def _tab3_demo_capacity_overrides_for_farm(farm_name: str) -> dict[str, dict]:
-    overrides: dict[str, dict] = {}
-    for sub in _subdivisions_for_farm(farm_name, ready_only=False):
-        overrides[str(sub)] = {
-            "DISABLE_CAPACITY": True,
-            "APPLY_CAPACITY": False,
-        }
-    return overrides
 
 
 def _parse_capacity_upload_df(df_raw: pd.DataFrame, default_farm: str | None = None) -> pd.DataFrame:
@@ -1081,7 +1154,7 @@ def _render_farm_backtesting_panel(default_farm: str | None = None) -> None:
                 "Горизонт as-of (месяцев назад)",
                 min_value=1,
                 max_value=6,
-                value=2,
+                value=4,
                 step=1,
                 key="tab3_bt_horizon",
             )
@@ -1095,7 +1168,7 @@ def _render_farm_backtesting_panel(default_farm: str | None = None) -> None:
             base_params_bt = apply_admin_overrides(get_param_source())
             bt_override = _farm_param_overrides_state().get(bt_farm) if _is_admin_mode() else None
             all_sub_overrides = _subdivision_param_overrides_state() if _is_admin_mode() else {}
-            cap_overrides_by_sub = _tab3_demo_capacity_overrides_for_farm(bt_farm)
+            cap_overrides_by_sub = _capacity_overrides_for_farm(bt_farm)
             farm_params_bt = _build_farm_params(base_params_bt, bt_override)
             bt_progress = st.progress(0.0)
             bt_status = st.empty()
@@ -1241,7 +1314,7 @@ def _render_results(monthly_all: pd.DataFrame, farm_infos: list[dict[str, Any]],
         over_col = (
             "Переполнение после перевода"
             if "Переполнение после перевода" in transfer_snapshot_monthly.columns
-            else "Переполнение (оценка)"
+            else ("Переполнение" if "Переполнение" in transfer_snapshot_monthly.columns else "Переполнение (оценка)")
         )
         if over_col in transfer_snapshot_monthly.columns:
             snap_work = transfer_snapshot_monthly.copy()
@@ -1283,7 +1356,7 @@ def _render_results(monthly_all: pd.DataFrame, farm_infos: list[dict[str, Any]],
     )
 
     if TAB3_SHOW_TRANSFER_SNAPSHOT:
-        st.subheader("Распределение коров по подразделениям (оценка мест)")
+        st.subheader("Распределение коров по подразделениям")
         if not (transfer_snapshot.empty and transfer_snapshot_monthly.empty):
             snapshot_view = transfer_snapshot
             if not transfer_snapshot_monthly.empty and "Месяц" in transfer_snapshot_monthly.columns:
@@ -1307,12 +1380,11 @@ def _render_results(monthly_all: pd.DataFrame, farm_infos: list[dict[str, Any]],
                 "Коровы до переводов",
                 "Коровы после переводов",
                 "Мест (коровы)",
-                "Оценка мест (коровы)",
                 "Источник мест",
-                "Переполнение (оценка)",
+                "Переполнение",
                 "Переполнение до перевода",
                 "Переполнение после перевода",
-                "Свободно мест (оценка)",
+                "Свободно мест",
                 "Свободно мест до перевода",
                 "Свободно мест после перевода",
                 "Переведено из подразделения",
@@ -1373,7 +1445,6 @@ def _render_results(monthly_all: pd.DataFrame, farm_infos: list[dict[str, Any]],
             "Куда перевести",
             "Рекомендовано перевести, голов",
             "Свободно в приёмнике, мест",
-            "Свободно в приёмнике, мест (оценка)",
         ]
         cols_order = [c for c in cols_order if c in transfer_recs.columns]
         st.dataframe(
@@ -1635,7 +1706,7 @@ def render_tab3_farm() -> None:
                     subs_all = _subdivisions_for_farm(farm, ready_only=True)
                     if not subs_all:
                         raise ValueError("Нет готовых подразделений для расчёта.")
-                    cap_overrides_by_sub = _tab3_demo_capacity_overrides_for_farm(farm)
+                    cap_overrides_by_sub = _capacity_overrides_for_farm(farm)
                     sub_overrides_for_farm = {
                         sub: ov
                         for sub in subs_all
@@ -1652,7 +1723,7 @@ def render_tab3_farm() -> None:
                                 runtime_ov = global_ov
                     ph_farm = _params_hash(
                         {
-                            "mode": "per_subdivision_params.v12",
+                            "mode": "per_subdivision_params.v13",
                             "farm_override": farm_override or {},
                             "subdivision_overrides": sub_overrides_for_farm,
                             "runtime_overrides": runtime_ov or {},
@@ -1725,10 +1796,15 @@ def render_tab3_farm() -> None:
                         info = {}
                     rec_payload = info.get("transfer_recommendations_monthly", info.get("transfer_recommendations"))
                     snap_payload = info.get("transfer_snapshot_monthly", info.get("transfer_snapshot"))
+                    transfer_meta = info.get("transfer_meta") if isinstance(info, dict) else None
                     need_rebuild_transfer = (
                         not isinstance(rec_payload, list)
                         or not isinstance(snap_payload, list)
                         or (len(rec_payload) == 0 and len(snap_payload) == 0)
+                        or (
+                            isinstance(transfer_meta, dict)
+                            and str(transfer_meta.get("capacity_mode") or "") == "calculated_capacity"
+                        )
                     )
                     if need_rebuild_transfer:
                         _push_log(f"{farm}: анализ переездов CARX и подбор переводов")
@@ -1840,14 +1916,36 @@ def render_tab3_farm() -> None:
                     continue
                 detect_df.loc[mask, "Подразделение"] = str(target_name)
                 detect_df.loc[mask, "Статус"] = "быки добавлены к комплекту Excel"
+        if isinstance(detect_df, pd.DataFrame) and not detect_df.empty:
+            for target_name, bundle in bundles.items():
+                if not _bundle_has_core_files(bundle) or not bundle.bulls:
+                    continue
+                mask = (
+                    (detect_df["Подразделение"].astype(str) == str(target_name))
+                    & (detect_df["Тип"].astype(str) == "bulls")
+                    & (detect_df["Статус"].astype(str) == "ok")
+                )
+                if bool(mask.any()):
+                    detect_df.loc[mask, "Статус"] = "быки добавлены к комплекту Excel"
         st.markdown("**Распознавание файлов**")
         st.dataframe(detect_df, use_container_width=True, hide_index=True)
 
-        if attached_bull_bundles:
-            attached_names = ", ".join(sorted(attached_bull_bundles.keys()))
+        bull_targets: list[str] = []
+        if isinstance(detect_df, pd.DataFrame) and not detect_df.empty:
+            bull_targets = sorted(
+                set(
+                    detect_df.loc[
+                        (detect_df["Тип"].astype(str) == "bulls")
+                        & (detect_df["Статус"].astype(str) == "быки добавлены к комплекту Excel"),
+                        "Подразделение",
+                    ].astype(str).tolist()
+                )
+            )
+        if bull_targets:
+            attached_names = ", ".join(bull_targets)
             st.caption(
-                "Файлы быков распознаны как отдельные подразделения по имени файла и автоматически "
-                f"прикреплены к общему комплекту Excel: {attached_names}."
+                "Файлы быков включены в комплект Excel для: "
+                f"{attached_names}."
             )
 
         summary_rows: list[dict[str, str]] = []

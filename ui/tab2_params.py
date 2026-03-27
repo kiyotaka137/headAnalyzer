@@ -18,6 +18,18 @@ from ui.tab3_farm_parts.storage import _load_farm_tables_from_db
 
 Token = Union[str, int]
 TAB2_GLOBAL_SCOPE = "__global__"
+SEASON_ORDER = [
+    ("winter", "Зима"),
+    ("spring", "Весна"),
+    ("summer", "Лето"),
+    ("autumn", "Осень"),
+]
+SEASON_MONTHS = {
+    "winter": (12, 1, 2),
+    "spring": (3, 4, 5),
+    "summer": (6, 7, 8),
+    "autumn": (9, 10, 11),
+}
 
 
 def _dict_get_any_key(d: Any, key: Token) -> Any:
@@ -196,6 +208,81 @@ def _ensure_semen_complements(overrides: Dict[str, Any]) -> Dict[str, Any]:
                 part["heifer_share"] = max(0.0, 1.0 - float(part["bull_share"]))
 
     return out
+
+
+def _seasonal_conception_values(params: dict) -> Dict[str, Dict[str, float]]:
+    ip = _get_by_tokens(params, ["INSEMINATION_PARAMS"]) if isinstance(params, dict) else None
+    if not isinstance(ip, dict):
+        ip = {}
+
+    out: Dict[str, Dict[str, float]] = {"cow": {}, "heifer": {}}
+    for animal_key in ("cow", "heifer"):
+        season_raw = _dict_get_any_key(ip, f"{animal_key}_conception_season_factors")
+        month_raw = _dict_get_any_key(ip, f"{animal_key}_conception_month_factors")
+        for season, months in SEASON_ORDER:
+            value: float | None = None
+            if isinstance(season_raw, dict):
+                raw = _dict_get_any_key(season_raw, season)
+                num = pd.to_numeric(raw, errors="coerce")
+                if not pd.isna(num):
+                    value = float(num)
+            if value is None and isinstance(month_raw, dict):
+                vals = []
+                for month in SEASON_MONTHS[season]:
+                    num = pd.to_numeric(_dict_get_any_key(month_raw, month), errors="coerce")
+                    if not pd.isna(num):
+                        vals.append(float(num))
+                if vals:
+                    value = float(sum(vals) / len(vals))
+            out[animal_key][season] = float(1.0 if value is None else value)
+    return out
+
+
+def _render_seasonal_conception_block(params: dict, *, editable: bool, key_prefix: str) -> Dict[str, Dict[str, float]]:
+    values = _seasonal_conception_values(params)
+    with st.expander("Сезонные коэффициенты зачатия", expanded=False):
+        st.caption("Коэффициенты автоматически применяются ко всем месяцам сезона.")
+        if not editable:
+            rows = []
+            for season, label in SEASON_ORDER:
+                rows.append(
+                    {
+                        "Сезон": label,
+                        "Коровы": _fmt(values["cow"][season]),
+                        "Тёлки": _fmt(values["heifer"][season]),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            return values
+
+        cols = st.columns(4)
+        edited: Dict[str, Dict[str, float]] = {"cow": {}, "heifer": {}}
+        for idx, (season, label) in enumerate(SEASON_ORDER):
+            with cols[idx]:
+                st.markdown(f"**{label}**")
+                edited["cow"][season] = float(
+                    st.number_input(
+                        "Коровы",
+                        min_value=0.75,
+                        max_value=1.25,
+                        value=float(values["cow"][season]),
+                        step=0.01,
+                        key=f"{key_prefix}_cow_{season}",
+                        format="%.3f",
+                    )
+                )
+                edited["heifer"][season] = float(
+                    st.number_input(
+                        "Тёлки",
+                        min_value=0.75,
+                        max_value=1.25,
+                        value=float(values["heifer"][season]),
+                        step=0.01,
+                        key=f"{key_prefix}_heifer_{season}",
+                        format="%.3f",
+                    )
+                )
+        return edited
 
 
 def _build_specs(final: dict) -> List[Spec]:
@@ -390,6 +477,7 @@ def render_tab2_params() -> None:
                                           
     if not bool(st.session_state.get("is_admin", False)):
         _render_grouped_readonly(df_all)
+        _render_seasonal_conception_block(final, editable=False, key_prefix=f"tab2_season_ro_{scope_key}")
         return
 
                                                                         
@@ -420,6 +508,7 @@ def render_tab2_params() -> None:
             st.rerun()
     if not edit_mode:
         _render_grouped_readonly(df_all)
+        _render_seasonal_conception_block(final, editable=False, key_prefix=f"tab2_season_ro_{scope_key}")
         return
 
                                                                     
@@ -437,6 +526,8 @@ def render_tab2_params() -> None:
             key=f"tab2_editor_{scope_key}_{idx}",
         )
         edited_blocks.append(edited_grp)
+
+    season_inputs = _render_seasonal_conception_block(final, editable=True, key_prefix=f"tab2_season_{scope_key}")
 
     if st.button("Сохранить и применить к прогнозу", use_container_width=True, key="tab2_save_apply"):
         overrides: Dict[str, Any] = {}
@@ -469,6 +560,18 @@ def render_tab2_params() -> None:
 
                 if not same:
                     _set_by_tokens(overrides, spec.tokens, parsed)
+                    changed += 1
+
+        base_seasons = _seasonal_conception_values(base)
+        for animal_key, param_key in (
+            ("cow", "cow_conception_season_factors"),
+            ("heifer", "heifer_conception_season_factors"),
+        ):
+            for season, _label in SEASON_ORDER:
+                new_val = float(season_inputs[animal_key][season])
+                base_val = float(base_seasons[animal_key][season])
+                if abs(new_val - base_val) > 1e-9:
+                    _set_by_tokens(overrides, ["INSEMINATION_PARAMS", param_key, season], new_val)
                     changed += 1
 
         overrides = _ensure_semen_complements(overrides)

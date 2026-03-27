@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict
 
+from core.date_parse import parse_mixed_datetime
 from db import engine
 
 TABLE_NAME = "inseminations_raw"
@@ -19,6 +20,7 @@ COLUMN_MAP: Dict[str, str] = {
     "DIM/Возраст": "dim_age",
     "Дата": "event_date",
     "Бык": "bull",
+    "Примечание": "bull",
     "Result": "result",
     "RESULT": "result",
     "R": "result",
@@ -126,7 +128,7 @@ def _read_excel_best_header(src, max_header: int = 20) -> pd.DataFrame:
                 ("Событие", "EVENT", "EVENT_TYPE"),
                 ("DIM/Возраст", "DIM", "Возраст", "DIM_AGE"),
                 ("Дата", "DATE", "EVENT_DATE"),
-                ("Бык", "BULL", "REMARK"),
+                ("Бык", "BULL", "REMARK", "Примечание"),
                 ("Result", "RESULT", "R", "Результат"),
                 ("T", "TECH_ID"),
                 ("Тип осеменения", "INSEMINATION_TYPE"),
@@ -175,7 +177,7 @@ def read_inseminations_excel(path_or_buffer, include_meta: bool = False) -> pd.D
         "event_type": _pick_first(df.columns, "Событие", "EVENT", "EVENT_TYPE"),
         "dim_age": _pick_first(df.columns, "DIM/Возраст", "DIM", "Возраст", "DIM_AGE", "AGE/DIM", "AGE_DIM"),
         "event_date": _pick_first(df.columns, "Дата", "DATE", "EVENT_DATE"),
-        "bull": _pick_first(df.columns, "Бык", "BULL", "REMARK"),
+        "bull": _pick_first(df.columns, "Бык", "BULL", "REMARK", "Примечание"),
         "result": _pick_first(df.columns, "Result", "RESULT", "R", "Результат"),
         "tech_id": _pick_first(df.columns, "T", "TECH_ID"),
         "insemination_type": _pick_first(df.columns, "Тип осеменения", "INSEMINATION_TYPE"),
@@ -231,7 +233,7 @@ def clean_inseminations(df: pd.DataFrame) -> pd.DataFrame:
 
                   
     if "event_date" in df.columns:
-        df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce", dayfirst=True)
+        df["event_date"] = parse_mixed_datetime(df["event_date"])
 
                    
     for col in ["id", "reg", "lact", "dim_age", "tech_id"]:

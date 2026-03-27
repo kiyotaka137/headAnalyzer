@@ -10,6 +10,7 @@ from typing import Any, Optional
 import pandas as pd
 import streamlit as st
 
+from core.date_parse import parse_mixed_datetime
 from etl.bulls import read_bulls_txt
 from etl.calvings_births import read_calvings_excel
 from etl.disposals import read_disposals_excel
@@ -32,7 +33,7 @@ TAB3_CAPACITY_TABLE = "tab3_capacity_places"
 
 TAB3_CACHE_SCHEMA_VERSION = "2026-03-03.v8"
 
-TAB3_UI_STATE_VERSION = "2026-02-26.v3"
+TAB3_UI_STATE_VERSION = "2026-03-24.v5"
 
 TAB3_SHOW_TRANSFER_SNAPSHOT = False
 
@@ -108,7 +109,7 @@ def _find_col(df: pd.DataFrame, *cands: str) -> Optional[str]:
     return None
 
 def _to_dt(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.normalize()
+    return parse_mixed_datetime(s).dt.normalize()
 
 def _norm_id(x: Any) -> str:
     if x is None:
@@ -214,7 +215,7 @@ def _fallback_inseminations(df_raw: pd.DataFrame) -> pd.DataFrame:
     lact_c = _find_col(df_raw, "LACT", "LACTATION")
     dim_c = _find_col(df_raw, "DIM", "DIM_AGE", "DAYS", "ВОЗРАСТ")
     date_c = _find_col(df_raw, "DATE", "EVENT_DATE", "ДАТА")
-    bull_c = _find_col(df_raw, "REMARK", "BULL", "B", "BULL_CODE", "БЫК")
+    bull_c = _find_col(df_raw, "REMARK", "ПРИМЕЧАНИЕ", "BULL", "B", "BULL_CODE", "БЫК")
     res_c = _find_col(df_raw, "R", "RESULT", "RES", "RESULT ")
 
     if reg_c is None or date_c is None:
@@ -395,8 +396,8 @@ def _prepare_tables(bundle: FarmUploadBundle) -> dict[str, pd.DataFrame]:
             calv_df[c] = pd.NA
     calv_df["reg"] = calv_df["reg"].map(_norm_id)
     calv_df["mother_reg"] = calv_df["mother_reg"].map(_norm_id)
-    calv_df["birth_date"] = pd.to_datetime(calv_df["birth_date"], errors="coerce", dayfirst=True)
-    calv_df["event_date"] = pd.to_datetime(calv_df["event_date"], errors="coerce", dayfirst=True)
+    calv_df["birth_date"] = parse_mixed_datetime(calv_df["birth_date"])
+    calv_df["event_date"] = parse_mixed_datetime(calv_df["event_date"])
     calv_df["sex"] = calv_df["sex"].map(_norm_sex)
     calv_df["event_type"] = calv_df["event_type"].map(_norm_event_type)
 
@@ -414,7 +415,7 @@ def _prepare_tables(bundle: FarmUploadBundle) -> dict[str, pd.DataFrame]:
     ins_df["reg"] = ins_df["reg"].map(_norm_id)
     ins_df["lact"] = pd.to_numeric(ins_df["lact"], errors="coerce")
     ins_df["dim_age"] = pd.to_numeric(ins_df["dim_age"], errors="coerce")
-    ins_df["event_date"] = pd.to_datetime(ins_df["event_date"], errors="coerce", dayfirst=True)
+    ins_df["event_date"] = parse_mixed_datetime(ins_df["event_date"])
     ins_df["bull"] = ins_df["bull"].map(_norm_id)
     ins_df["result"] = ins_df["result"].astype(str).str.strip()
 
@@ -431,7 +432,7 @@ def _prepare_tables(bundle: FarmUploadBundle) -> dict[str, pd.DataFrame]:
             dry_df[c] = pd.NA
     dry_df["reg"] = dry_df["reg"].map(_norm_id)
     dry_df["dim"] = pd.to_numeric(dry_df["dim"], errors="coerce")
-    dry_df["event_date"] = pd.to_datetime(dry_df["event_date"], errors="coerce", dayfirst=True)
+    dry_df["event_date"] = parse_mixed_datetime(dry_df["event_date"])
     dry_df["move_reason"] = dry_df["disposal_reason"].astype(str).str.replace("\u00a0", " ", regex=False).str.strip()
 
     _rewind(bundle.disp)
@@ -446,7 +447,7 @@ def _prepare_tables(bundle: FarmUploadBundle) -> dict[str, pd.DataFrame]:
         if c not in disp_df.columns:
             disp_df[c] = pd.NA
     disp_df["reg"] = disp_df["reg"].map(_norm_id)
-    disp_df["event_date"] = pd.to_datetime(disp_df["event_date"], errors="coerce", dayfirst=True)
+    disp_df["event_date"] = parse_mixed_datetime(disp_df["event_date"])
 
     bulls_frames: list[pd.DataFrame] = []
     for bf in bundle.bulls:

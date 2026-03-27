@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, Tuple
 
 import pandas as pd
 
+from core.date_parse import parse_mixed_datetime
 from db import engine
 
                                                                                
@@ -158,7 +159,7 @@ def _norm_event_type_value(x: Any) -> str:
 
 
 def _to_datetime(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+    return parse_mixed_datetime(s)
 
 
 def _as_excel_source(file: Any):
@@ -421,9 +422,9 @@ def clean_calvings(df: pd.DataFrame) -> pd.DataFrame:
     df = df[target_cols]
 
           
-    df["birth_date"] = pd.to_datetime(df["birth_date"], errors="coerce", dayfirst=True)
-    df["disposal_date"] = pd.to_datetime(df["disposal_date"], errors="coerce", dayfirst=True)
-    df["event_date"] = pd.to_datetime(df["event_date"], errors="coerce", dayfirst=True)
+    df["birth_date"] = parse_mixed_datetime(df["birth_date"])
+    df["disposal_date"] = parse_mixed_datetime(df["disposal_date"])
+    df["event_date"] = parse_mixed_datetime(df["event_date"])
 
     df["lact"] = pd.to_numeric(df["lact"], errors="coerce")
     df["age"] = pd.to_numeric(df["age"], errors="coerce")

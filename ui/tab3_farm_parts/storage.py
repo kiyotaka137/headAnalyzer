@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 
+from core.date_parse import parse_mixed_date
 from db import engine
 from .common import *
 from .common import _json_hash
@@ -659,9 +660,9 @@ def _save_farm_tables_to_db(farm_name: str, tables: dict[str, pd.DataFrame], rep
         dfx = dfx.drop_duplicates(subset=cols, keep="last")
 
         if "birth_date" in dfx.columns:
-            dfx["birth_date"] = pd.to_datetime(dfx["birth_date"], errors="coerce", dayfirst=True).dt.date
+            dfx["birth_date"] = parse_mixed_date(dfx["birth_date"])
         if "event_date" in dfx.columns:
-            dfx["event_date"] = pd.to_datetime(dfx["event_date"], errors="coerce", dayfirst=True).dt.date
+            dfx["event_date"] = parse_mixed_date(dfx["event_date"])
 
         dfx.insert(0, "farm_name", farm)
         dfx.to_sql(TAB3_TABLES[key], con=engine, if_exists="append", index=False, method="multi", chunksize=2000)

@@ -30,13 +30,14 @@ forecast_dynamic.py
   определённого по последнему P-осеменению перед отёлом.
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Mapping, Tuple
 
 import numpy as np
 import pandas as pd
 
+from core.insemination_success import SERVICE_RESULT_MARKERS, infer_confirmed_conceptions
 from db import engine
 from forecast_dynamic_normalization import (
     SemenSexRatio,
@@ -56,6 +57,8 @@ from model_params import (
     CONCEPTION_PARAMS,
     DISPOSAL_PARAMS,
     ANNUAL_DISPOSAL_RATE,
+    HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE,
+    BULL_CALF_DAILY_EXIT_RATE,
     SEMEN_USAGE_PROBS,
     SEMEN_SEX_RATIOS,
     INSEMINATION_PARAMS,
@@ -69,6 +72,37 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _prepare_calving_rows(calv: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(calv, pd.DataFrame) or calv.empty:
+        return pd.DataFrame(
+            columns=[
+                "reg_s",
+                "mother_reg_s",
+                "event_type_n",
+                "event_date_n",
+                "birth_date_n",
+                "calving_dt_n",
+                "sex_norm",
+            ]
+        )
+
+    c = calv.copy()
+    c["event_type_n"] = c.get("event_type", pd.Series(dtype=object)).apply(norm_event_type)
+    c["event_date_n"] = pd.to_datetime(c.get("event_date"), errors="coerce").dt.normalize()
+    c["birth_date_n"] = pd.to_datetime(c.get("birth_date"), errors="coerce").dt.normalize()
+    c["reg_s"] = c.get("reg", pd.Series(dtype=object)).apply(norm_id)
+    c["mother_reg_s"] = c.get("mother_reg", pd.Series(dtype=object)).apply(norm_id)
+    c["sex_norm"] = c.get("sex", pd.Series(dtype=object)).apply(norm_sex)
+    c["calving_dt_n"] = c["event_date_n"]
+    born_mask = c["event_type_n"] == "РОЖДЕН"
+    if bool(born_mask.any()):
+        c.loc[born_mask, "calving_dt_n"] = c.loc[born_mask, "birth_date_n"].where(
+            c.loc[born_mask, "birth_date_n"].notna(),
+            c.loc[born_mask, "event_date_n"],
+        )
+    return c
+
+
 def _extract_calf_births(calv: pd.DataFrame, as_of_ts: pd.Timestamp) -> pd.DataFrame:
     """
     Возвращает уникальные рождения телят (reg телёнка) с датой рождения и полом.
@@ -77,12 +111,7 @@ def _extract_calf_births(calv: pd.DataFrame, as_of_ts: pd.Timestamp) -> pd.DataF
     if calv.empty:
         return pd.DataFrame(columns=["reg_s", "birth_dt", "sex_norm"])
 
-    c = calv.copy()
-    c["event_type_n"] = c["event_type"].apply(norm_event_type)
-    c["event_date_n"] = pd.to_datetime(c["event_date"], errors="coerce").dt.normalize()
-    c["birth_date_n"] = pd.to_datetime(c["birth_date"], errors="coerce").dt.normalize()
-    c["reg_s"] = c["reg"].apply(norm_id)
-    c["sex_norm"] = c["sex"].apply(norm_sex)
+    c = _prepare_calving_rows(calv)
 
     born = c[
         (c["event_type_n"] == "РОЖДЕН")
@@ -179,8 +208,48 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 
 
 def _normalize_month_factor_map(raw: Any) -> dict[int, float]:
-    # Сезонные коэффициенты пока намеренно отключены.
-    return {m: 1.0 for m in range(1, 13)}
+    out = {m: 1.0 for m in range(1, 13)}
+    if not isinstance(raw, dict):
+        return out
+
+    for k, v in raw.items():
+        try:
+            month = int(k)
+            value = float(v)
+        except Exception:
+            continue
+        if month < 1 or month > 12 or not np.isfinite(value):
+            continue
+        out[month] = _clamp(value, 0.75, 1.25)
+    return out
+
+
+_SEASON_MONTHS: dict[str, tuple[int, ...]] = {
+    "winter": (12, 1, 2),
+    "spring": (3, 4, 5),
+    "summer": (6, 7, 8),
+    "autumn": (9, 10, 11),
+}
+
+
+def _apply_season_factors_to_month_map(raw: Any, base_map: dict[int, float]) -> dict[int, float]:
+    out = dict(base_map or {m: 1.0 for m in range(1, 13)})
+    if not isinstance(raw, dict):
+        return out
+
+    for season, months in _SEASON_MONTHS.items():
+        if season not in raw:
+            continue
+        try:
+            value = float(raw.get(season))
+        except Exception:
+            continue
+        if not np.isfinite(value):
+            continue
+        value = _clamp(value, 0.75, 1.25)
+        for month in months:
+            out[int(month)] = value
+    return out
 
 
 def _normalize_semen_usage_shares(raw: Any) -> dict[str, float] | None:
@@ -362,22 +431,42 @@ def _resolve_runtime_params(overrides: dict | None) -> dict:
 
     disp = ov.get("DISPOSAL_PARAMS") or deepcopy(DISPOSAL_PARAMS)
     annual_disp = float(ov.get("ANNUAL_DISPOSAL_RATE", ANNUAL_DISPOSAL_RATE))
+    heifer_precalving_disp = float(
+        ov.get(
+            "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE",
+            ov.get("heifer_precalving_annual_disposal_rate", HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE),
+        )
+    )
+    bull_calf_exit = float(
+        ov.get(
+            "BULL_CALF_DAILY_EXIT_RATE",
+            ov.get("bull_calf_daily_exit_rate", BULL_CALF_DAILY_EXIT_RATE),
+        )
+    )
 
     ins = ov.get("INSEMINATION_PARAMS") or {
         "cow_services_per_conception": float(INSEMINATION_PARAMS.cow_services_per_conception),
         "cow_ai_interval_days": float(INSEMINATION_PARAMS.cow_ai_interval_days),
+        "cow_pregnancy_loss_rate": float(INSEMINATION_PARAMS.cow_pregnancy_loss_rate),
         "cow_first_ai_dim_by_lact": dict(INSEMINATION_PARAMS.cow_first_ai_dim_by_lact),
         "cow_conception_month_factors": dict(INSEMINATION_PARAMS.cow_conception_month_factors),
         "heifer_services_per_conception": float(INSEMINATION_PARAMS.heifer_services_per_conception),
         "heifer_ai_interval_days": float(INSEMINATION_PARAMS.heifer_ai_interval_days),
+        "heifer_pregnancy_loss_rate": float(INSEMINATION_PARAMS.heifer_pregnancy_loss_rate),
         "heifer_first_ai_age_days": float(INSEMINATION_PARAMS.heifer_first_ai_age_days),
         "heifer_conception_month_factors": dict(INSEMINATION_PARAMS.heifer_conception_month_factors),
     }
-    ins["cow_conception_month_factors"] = _normalize_month_factor_map(
-        ins.get("cow_conception_month_factors", INSEMINATION_PARAMS.cow_conception_month_factors)
+    ins["cow_conception_month_factors"] = _apply_season_factors_to_month_map(
+        ins.get("cow_conception_season_factors"),
+        _normalize_month_factor_map(
+            ins.get("cow_conception_month_factors", INSEMINATION_PARAMS.cow_conception_month_factors)
+        ),
     )
-    ins["heifer_conception_month_factors"] = _normalize_month_factor_map(
-        ins.get("heifer_conception_month_factors", INSEMINATION_PARAMS.heifer_conception_month_factors)
+    ins["heifer_conception_month_factors"] = _apply_season_factors_to_month_map(
+        ins.get("heifer_conception_season_factors"),
+        _normalize_month_factor_map(
+            ins.get("heifer_conception_month_factors", INSEMINATION_PARAMS.heifer_conception_month_factors)
+        ),
     )
 
     semen_usage = _normalize_semen_usage_shares(ov.get("SEMEN_USAGE_SHARES"))
@@ -403,6 +492,8 @@ def _resolve_runtime_params(overrides: dict | None) -> dict:
     dry_days = max(20, min(120, dry_days))
 
     annual_disp = float(max(0.0, min(0.5, annual_disp)))
+    heifer_precalving_disp = float(max(0.0, min(0.5, heifer_precalving_disp)))
+    bull_calf_exit = float(max(0.0, min(0.8, bull_calf_exit)))
     apply_capacity = _as_bool(ov.get("APPLY_CAPACITY"), True)
     if _as_bool(ov.get("DISABLE_CAPACITY"), False):
         apply_capacity = False
@@ -413,6 +504,8 @@ def _resolve_runtime_params(overrides: dict | None) -> dict:
         "CONCEPTION_PARAMS": cp,
         "DISPOSAL_PARAMS": disp,
         "ANNUAL_DISPOSAL_RATE": annual_disp,
+        "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE": heifer_precalving_disp,
+        "BULL_CALF_DAILY_EXIT_RATE": bull_calf_exit,
         "INSEMINATION_PARAMS": ins,
         "SEMEN_USAGE_SHARES": semen_usage,
         "HERD_CAPACITY_NORM": cap_norm,
@@ -454,6 +547,21 @@ def _copy_state(s: HerdState) -> HerdState:
         heifer_preg={k: v.copy() for k, v in s.heifer_preg.items()},
         bull_age=s.bull_age.copy(),
     )
+
+
+def _state_group_snapshot(state: HerdState) -> Dict[str, float]:
+    cows_open = sum(float(state.open_dim[l].sum()) for l in (1, 2, 3, 4))
+    cows_preg_lact = sum(float(state.preg_lact[(l, s)].sum()) for l in (1, 2, 3, 4) for s in ("trad", "sex"))
+    cows_preg_dry = sum(float(state.preg_dry[(l, s)].sum()) for l in (1, 2, 3, 4) for s in ("trad", "sex"))
+    return {
+        "Дойные коровы": float(cows_open + cows_preg_lact),
+        "Сухостойные коровы": float(cows_preg_dry),
+        "Тёлки 0–3 мес": float(state.heifer_age[:90].sum()),
+        "Бычки 0–2 мес": float(state.bull_age[:61].sum()),
+        "Тёлки 3–8 мес": float(state.heifer_age[90:270].sum()),
+        "Тёлки ≥9 мес": float(state.heifer_age[270:].sum()),
+        "Нетели": float(state.heifer_preg["trad"].sum() + state.heifer_preg["sex"].sum()),
+    }
 
 
                                                               
@@ -669,12 +777,14 @@ def compute_semen_sex_ratios_from_db(tables: Dict[str, pd.DataFrame]) -> Dict[st
     ins["reg_s"] = ins["reg"].apply(norm_id)
     ins["bull_s"] = ins["bull"].apply(norm_id)
 
-    p = ins[
-        (ins["event_date"].notna())
-        & (ins["result_norm"] == "P")
-        & (ins["reg_s"] != "")
-        & (ins["bull_s"] != "")
-    ][["reg_s", "event_date", "bull_s"]].copy()
+    conc = infer_confirmed_conceptions(ins)
+    if conc.empty:
+        return fallback
+
+    p = conc[
+        (conc["reg_s"] != "")
+        & (conc["bull_s"].fillna("") != "")
+    ][["reg_s", "concept_date", "bull_s"]].copy()
     if p.empty:
         return fallback
 
@@ -687,7 +797,7 @@ def compute_semen_sex_ratios_from_db(tables: Dict[str, pd.DataFrame]) -> Dict[st
     if p.empty:
         return fallback
 
-    p = p.rename(columns={"event_date": "ins_dt"})
+    p = p.rename(columns={"concept_date": "ins_dt"})
 
     m = _merge_asof_safe(
         calv_ev.sort_values(["reg_s", "calving_dt"], kind="mergesort"),
@@ -912,7 +1022,12 @@ def _apply_capacity_month_end(
         "over_h9": 0.0,
         "over_neteli": 0.0,
         "sell_cows": 0.0,
+        "sell_cows_doy": 0.0,
+        "sell_cows_dry": 0.0,
         "sell_heifers": 0.0,
+        "sell_heifers_h0": 0.0,
+        "sell_heifers_h38": 0.0,
+        "sell_heifers_h9": 0.0,
         "sell_neteli": 0.0,
     }
 
@@ -942,6 +1057,7 @@ def _apply_capacity_month_end(
         sold = _sell_cows_from_doy(state, need, gest_days)
         out["over_doy"] += sold
         out["sell_cows"] += sold
+        out["sell_cows_doy"] += sold
 
     cows_open = sum(state.open_dim[l].sum() for l in (1, 2, 3, 4))
     cows_preg_lact = sum(state.preg_lact[(l, s)].sum() for l in (1, 2, 3, 4) for s in ("trad", "sex"))
@@ -955,6 +1071,7 @@ def _apply_capacity_month_end(
         sold = _sell_cows_from_dry(state, need, gest_days, dry_days)
         out["over_dry"] += sold
         out["sell_cows"] += sold
+        out["sell_cows_dry"] += sold
 
                                  
     if cap_h0 is not None and h0 > cap_h0 + 1e-9:
@@ -962,12 +1079,14 @@ def _apply_capacity_month_end(
         sold = _sell_heifers_by_age(state, need, 0, 89)
         out["over_h0"] += sold
         out["sell_heifers"] += sold
+        out["sell_heifers_h0"] += sold
 
     if cap_h38 is not None and h38 > cap_h38 + 1e-9:
         need = h38 - cap_h38
         sold = _sell_heifers_by_age(state, need, 90, 269)
         out["over_h38"] += sold
         out["sell_heifers"] += sold
+        out["sell_heifers_h38"] += sold
 
     if cap_h924 is not None:
         h9 = float(state.heifer_age[270:].sum())
@@ -993,6 +1112,7 @@ def _apply_capacity_month_end(
             out["over_h9"] += float(sold_h9)
             out["over_neteli"] += float(sold_n)
             out["sell_heifers"] += float(sold_h9)
+            out["sell_heifers_h9"] += float(sold_h9)
             out["sell_neteli"] += float(sold_n)
 
                                                                                                
@@ -1029,6 +1149,8 @@ def _build_cow_like_regs(
     ins: pd.DataFrame,
     dry: pd.DataFrame,
     cows_regs: set[str],
+    first_calv_by_reg: dict[str, pd.Timestamp] | None = None,
+    as_of_ts: pd.Timestamp | None = None,
 ) -> set[str]:
     """
     Список регов, которые С БОЛЬШОЙ вероятностью коровы, даже если lact в inseminations пустой/0.
@@ -1040,7 +1162,12 @@ def _build_cow_like_regs(
         tmp = ins.copy()
         tmp["reg_s"] = tmp["reg"].apply(norm_id)
         tmp["lact_i"] = pd.to_numeric(tmp["lact"], errors="coerce").fillna(0).astype(int)
-        out |= set(tmp.loc[tmp["lact_i"] > 0, "reg_s"].astype(str))
+        cand = tmp.loc[tmp["lact_i"] > 0, "reg_s"].astype(str)
+        if first_calv_by_reg and as_of_ts is not None and not cand.empty:
+            first_dt = cand.map(first_calv_by_reg)
+            keep = pd.to_datetime(first_dt, errors="coerce").isna() | (pd.to_datetime(first_dt, errors="coerce") <= as_of_ts)
+            cand = cand.loc[keep]
+        out |= set(cand)
 
     if not dry.empty:
         tmp = dry.copy()
@@ -1066,6 +1193,7 @@ def _estimate_active_cow_regs_at_asof(
     dry: pd.DataFrame,
     as_of_ts: pd.Timestamp,
     lookback_days: int = 540,
+    first_calv_by_reg: dict[str, pd.Timestamp] | None = None,
 ) -> set[str]:
     """
     Оценка "фактически присутствующих" коров на дату старта прогноза.
@@ -1090,6 +1218,9 @@ def _estimate_active_cow_regs_at_asof(
             & (d["lact_n"] > 0)
             & (d["reg_s"] != "")
         )
+        if first_calv_by_reg:
+            first_dt = pd.to_datetime(d["reg_s"].map(first_calv_by_reg), errors="coerce")
+            m &= first_dt.isna() | (first_dt <= as_of_ts)
         out |= set(d.loc[m, "reg_s"].astype(str))
 
     if isinstance(calv, pd.DataFrame) and not calv.empty:
@@ -1140,19 +1271,14 @@ def _infer_semen_for_calvings(
         calv_ev["semen"] = "trad"
         return calv_ev
 
-    ins2["event_date"] = pd.to_datetime(ins2["event_date"], errors="coerce").dt.normalize()
-    ins2["result_norm"] = ins2["result"].apply(norm_result)
-    ins2["reg_s"] = ins2["reg"].apply(norm_id)
-    ins2["bull_s"] = ins2["bull"].apply(norm_id)
-
-    p = ins2[(ins2["event_date"].notna()) & (ins2["result_norm"] == "P") & (ins2["reg_s"] != "")].copy()
+    p = infer_confirmed_conceptions(ins2)
     if p.empty:
         calv_ev["semen"] = "trad"
         return calv_ev
 
     p["semen"] = p["bull_s"].map(semen_by_bull)
     p.loc[~p["semen"].isin(["trad", "sex"]), "semen"] = "trad"
-    p = p.rename(columns={"event_date": "ins_dt"})
+    p = p.rename(columns={"concept_date": "ins_dt"})
 
     left = calv_ev.sort_values(["cow_reg_s", "calving_dt"], kind="mergesort").copy()
     right = p[["reg_s", "ins_dt", "semen"]].sort_values(["reg_s", "ins_dt"], kind="mergesort")
@@ -1178,162 +1304,6 @@ def _infer_semen_for_calvings(
     return m
 
 
-def _seed_youngstock_from_calvings(
-    *,
-    state: HerdState,
-    calv: pd.DataFrame,
-    ins: pd.DataFrame,
-    semen_by_bull: Dict[str, str],
-    semen_sex_ratios: Dict[str, SemenSexRatio],
-    disposed_regs: set[str],
-    as_of_ts: pd.Timestamp,
-    gest_days: int,
-    cow_like_regs: set[str] | None = None,
-) -> None:
-    cow_like_regs = cow_like_regs or set()
-
-    calv2 = calv.copy()
-
-    if "event_type" in calv2.columns:
-        calv2["event_type_n"] = calv2["event_type"].map(norm_event_type)
-    else:
-        calv2["event_type_n"] = None
-
-    if "event_date" in calv2.columns:
-        calv2["event_date_n"] = pd.to_datetime(calv2["event_date"], errors="coerce").dt.normalize()
-    else:
-        calv2["event_date_n"] = pd.NaT
-
-    if "reg" in calv2.columns:
-        calv2["reg_s"] = calv2["reg"].map(norm_id)
-    else:
-        calv2["reg_s"] = ""
-
-    if "mother_reg" in calv2.columns:
-        calv2["mother_reg_s"] = calv2["mother_reg"].map(norm_id)
-    else:
-        calv2["mother_reg_s"] = ""
-
-    src = "gndr" if "gndr" in calv2.columns else ("sex" if "sex" in calv2.columns else None)
-    if src is not None:
-        calv2["gndr_n"] = calv2[src].map(norm_gender)
-    else:
-        calv2["gndr_n"] = None
-
-
-
-    calv2 = calv2[
-        (calv2["event_type_n"] == "РОЖДЕН")
-        & (calv2["event_date_n"].notna())
-        & (calv2["event_date_n"] <= as_of_ts)
-        & (calv2["reg_s"] != "")
-    ].copy()
-
-    if calv2.empty:
-        return
-
-    ins2 = ins.copy()
-    ins2["event_date"] = pd.to_datetime(ins2["event_date"], errors="coerce").dt.normalize()
-    ins2["reg_s"] = ins2["reg"].apply(norm_id)
-    ins2["bull_s"] = ins2["bull"].apply(norm_id)
-    ins2 = ins2[(ins2["event_date"].notna()) & (ins2["event_date"] <= as_of_ts) & (ins2["reg_s"] != "")].copy()
-
-    bull_by_mother_date: dict[tuple[str, pd.Timestamp], str] = {}
-    if not ins2.empty:
-        ins2 = ins2.sort_values(["reg_s", "event_date"], kind="mergesort")
-        tail = ins2.groupby(["reg_s", "event_date"], sort=False).tail(1)
-        bull_by_mother_date = dict(zip(zip(tail["reg_s"], tail["event_date"]), tail["bull_s"]))
-
-    for rr in calv2.itertuples(index=False):
-        calf_reg = str(rr.reg_s)
-        if not calf_reg or calf_reg in disposed_regs:
-            continue
-
-        if calf_reg in cow_like_regs:
-            continue
-
-        born_dt = rr.event_date_n
-        if pd.isna(born_dt):
-            continue
-
-        age = int((as_of_ts - pd.Timestamp(born_dt)).days)
-        if age < 0 or age > MAX_AGE_DAYS:
-            continue
-
-        mother = str(rr.mother_reg_s) if hasattr(rr, "mother_reg_s") else ""
-        bull = bull_by_mother_date.get((mother, pd.Timestamp(born_dt).normalize()), "") if mother else ""
-        semen = semen_by_bull.get(bull, "trad") if bull else "trad"
-        ratio = semen_sex_ratios.get(semen, semen_sex_ratios["trad"])
-
-        g = str(rr.gndr_n) if hasattr(rr, "gndr_n") else ""
-        if g == "F":
-            state.heifer_age[age] += 1.0
-        elif g == "M":
-            if 0 <= age < len(state.bull_age):
-                state.bull_age[age] += 1.0
-
-        else:
-            state.heifer_age[age] += float(ratio.heifer_share)
-            state.bull_age[age] += float(ratio.bull_share)
-
-
-def _warmstart_heifer_preg_from_stock_if_empty(
-    *,
-    state: HerdState,
-    ins_params: dict,
-    gest_days: int,
-) -> float:
-    """
-    Если на старте нет ни одной нетели (heifer_preg == 0), но есть зрелые тёлки,
-    добавляем мягкий warm-start нетелей из age-структуры.
-
-    Это защищает от искусственных нулей в подразделениях, где в выгрузке
-    не хватает явных осеменений тёлок (lact<=0), но молодняк фактически есть.
-    """
-    cur = float(state.heifer_preg["trad"].sum() + state.heifer_preg["sex"].sum())
-    if cur > 1e-9:
-        return 0.0
-
-    first_ai_age = float(
-        ins_params.get("heifer_first_ai_age_days", float(INSEMINATION_PARAMS.heifer_first_ai_age_days))
-    )
-    first_h = int(_clamp(first_ai_age, 0.0, float(MAX_AGE_DAYS)))
-    if first_h >= len(state.heifer_age):
-        return 0.0
-
-    eligible = float(state.heifer_age[first_h:].sum())
-    min_eligible = float(ins_params.get("heifer_zero_warmstart_min_eligible", 50.0))
-    if eligible < max(1.0, min_eligible):
-        return 0.0
-
-    heif_spc = float(
-        ins_params.get("heifer_services_per_conception", float(INSEMINATION_PARAMS.heifer_services_per_conception))
-    )
-                                                  
-    base_conc = 1.0 / max(1e-9, heif_spc)
-    scale = float(ins_params.get("heifer_zero_warmstart_scale", 0.25))
-    preg_frac = _clamp(base_conc * scale, 0.02, 0.35)
-    n_preg = eligible * preg_frac
-    if n_preg <= 1e-9:
-        return 0.0
-
-    lo = int(_clamp(float(ins_params.get("heifer_zero_warmstart_gest_lo_days", 0.0)), 0.0, float(gest_days)))
-    hi = int(_clamp(float(ins_params.get("heifer_zero_warmstart_gest_hi_days", float(gest_days))), 0.0, float(gest_days)))
-    if hi < lo:
-        lo, hi = hi, lo
-    bins = max(1, hi - lo + 1)
-
-    sex_share = _clamp(float(ins_params.get("heifer_zero_warmstart_sex_share", float(SEMEN_USAGE_PROBS.heifer_sex))), 0.0, 1.0)
-    add_per_day = n_preg / float(bins)
-
-    state.heifer_preg["sex"][lo : hi + 1] += add_per_day * sex_share
-    state.heifer_preg["trad"][lo : hi + 1] += add_per_day * (1.0 - sex_share)
-
-    deplete = min(0.95, n_preg / max(1e-9, eligible))
-    state.heifer_age[first_h:] *= (1.0 - deplete)
-    return float(n_preg)
-
-
 def build_initial_state(
     tables: Dict[str, pd.DataFrame],
     as_of: date,
@@ -1344,27 +1314,45 @@ def build_initial_state(
     warmstart_from_services: bool = True,
     semen_sex_ratios: Dict[str, SemenSexRatio] | None = None,
 ) -> HerdState:
-    """
-    Собираем агрегированное состояние стада на дату as_of.
-
-    Главное исправление "нулей в тёлках" без раздувания:
-      1) Молодняк/тёлки до ~18 мес сеем из calvings_births (РОЖДЕН) + fallback по отёлу матери.
-      2) Старше ~18 мес НЕ пытаемся восстановить по древним рождениям (иначе раздувает).
-      3) Исключаем cow_like_regs и тёлок-нетелей (P) из возрастного посева, чтобы не было double count.
-      4) ins-only подсев тёлок включаем ТОЛЬКО если в calvings почти нет строк телят.
-    """
+    """Собираем агрегированное состояние стада на дату as_of из animal-level snapshot."""
     gest_days = int(gest_days if gest_days is not None else int(GESTATION_DAYS))
     dry_days = int(dry_days if dry_days is not None else int(DRY_DAYS))
     as_of_ts = pd.Timestamp(as_of).normalize()
 
-    state = init_empty_state(gest_days)
+    snapshot = build_animal_asof_snapshot(
+        tables,
+        as_of=as_of,
+        gest_days=gest_days,
+        dry_days=dry_days,
+        insemination_params=insemination_params,
+        warmstart_from_services=warmstart_from_services,
+    )
+    state = _state_from_animal_asof_snapshot(snapshot, gest_days)
+    return state
 
-    calv = tables["calv"].copy()
-    ins = tables["ins"].copy()
-    dry = tables["dry"].copy()
-    disp = tables["disp"].copy()
-    bulls = tables["bulls"].copy()
 
+def build_animal_asof_snapshot(
+    tables: Dict[str, pd.DataFrame],
+    as_of: date,
+    *,
+    gest_days: int | None = None,
+    dry_days: int | None = None,
+    insemination_params: dict | None = None,
+    warmstart_from_services: bool = True,
+) -> pd.DataFrame:
+    gest_days = int(gest_days if gest_days is not None else int(GESTATION_DAYS))
+    dry_days = int(dry_days if dry_days is not None else int(DRY_DAYS))
+    as_of_ts = pd.Timestamp(as_of).normalize()
+
+    calv = tables.get("calv", pd.DataFrame()).copy()
+    ins = tables.get("ins", pd.DataFrame()).copy()
+    dry = tables.get("dry", pd.DataFrame()).copy()
+    disp = tables.get("disp", pd.DataFrame()).copy()
+    bulls = tables.get("bulls", pd.DataFrame()).copy()
+
+    for col in ("event_date", "result", "lact", "dim_age", "reg", "bull"):
+        if col not in ins.columns:
+            ins[col] = pd.NA
     ins["event_date"] = pd.to_datetime(ins["event_date"], errors="coerce").dt.normalize()
     ins["result_norm"] = ins["result"].apply(norm_result)
     ins["lact"] = pd.to_numeric(ins["lact"], errors="coerce").fillna(0).astype(int)
@@ -1372,12 +1360,23 @@ def build_initial_state(
     ins["reg_s"] = ins["reg"].apply(norm_id)
     ins["bull_s"] = ins["bull"].apply(norm_id)
 
+    for col in ("event_date", "reg", "dim"):
+        if col not in dry.columns:
+            dry[col] = pd.NA
     dry["event_date"] = pd.to_datetime(dry["event_date"], errors="coerce").dt.normalize()
     dry["reg_s"] = dry["reg"].apply(norm_id)
+    dry["dim"] = pd.to_numeric(dry.get("dim"), errors="coerce")
 
+    for col in ("event_date", "reg", "disposal_reason"):
+        if col not in disp.columns:
+            disp[col] = pd.NA
     disp["event_date"] = pd.to_datetime(disp["event_date"], errors="coerce").dt.normalize()
     disp["reg_s"] = disp["reg"].apply(norm_id)
 
+    if "bull_code" not in bulls.columns:
+        bulls["bull_code"] = pd.NA
+    if "bull_type" not in bulls.columns:
+        bulls["bull_type"] = pd.NA
     bulls["bull_code_s"] = bulls["bull_code"].apply(norm_id)
     bulls["semen"] = bulls["bull_type"].apply(classify_semen_from_bull_type)
     semen_by_bull = dict(zip(bulls["bull_code_s"], bulls["semen"]))
@@ -1396,33 +1395,76 @@ def build_initial_state(
     dry_ok = dry[(dry["event_date"].notna()) & (dry["event_date"] <= as_of_ts) & (dry["reg_s"] != "")]
     dry_last = dry_ok.groupby("reg_s", sort=False)["event_date"].max().to_dict()
 
-    calv2 = calv.copy()
-    calv2["event_type_n"] = calv2["event_type"].apply(norm_event_type)
-    calv2["event_date_n"] = pd.to_datetime(calv2["event_date"], errors="coerce").dt.normalize()
-    calv2["reg_s"] = calv2["reg"].apply(norm_id)
-    calv2["mother_reg_s"] = calv2["mother_reg"].apply(norm_id)
-    calv2 = calv2[(calv2["event_date_n"].notna()) & (calv2["event_date_n"] <= as_of_ts)].copy()
+    calv2 = _prepare_calving_rows(calv)
 
-    calves_born = calv2[
+    full_first_calv_by_reg: dict[str, pd.Timestamp] = {}
+    full_last_calv_by_reg: dict[str, pd.Timestamp] = {}
+    full_born = calv2[
         (calv2["event_type_n"] == "РОЖДЕН")
         & (calv2["mother_reg_s"] != "")
-        & (calv2["event_date_n"].notna())
-    ][["mother_reg_s", "event_date_n"]].drop_duplicates()
-
-    calves_otel = calv2[
+        & (calv2["calving_dt_n"].notna())
+    ][["mother_reg_s", "calving_dt_n"]].drop_duplicates()
+    full_otel = calv2[
         (calv2["event_type_n"] == "ОТЕЛ")
         & (calv2["reg_s"] != "")
-        & (calv2["event_date_n"].notna())
-    ][["reg_s", "event_date_n"]].drop_duplicates()
+        & (calv2["calving_dt_n"].notna())
+    ][["reg_s", "calving_dt_n"]].drop_duplicates()
+    full_parts: list[pd.DataFrame] = []
+    if not full_born.empty:
+        full_parts.append(full_born.rename(columns={"mother_reg_s": "reg_s", "calving_dt_n": "calving_date"}))
+    if not full_otel.empty:
+        full_parts.append(full_otel.rename(columns={"calving_dt_n": "calving_date"}))
+    if full_parts:
+        full_events = (
+            pd.concat(full_parts, ignore_index=True)
+            .drop_duplicates(subset=["reg_s", "calving_date"], keep="last")
+            .sort_values(["reg_s", "calving_date"], kind="mergesort")
+        )
+        full_first_calv_by_reg = (
+            full_events.drop_duplicates(subset=["reg_s"], keep="first")
+            .set_index("reg_s")["calving_date"]
+            .to_dict()
+        )
+        full_last_calv_by_reg = (
+            full_events.drop_duplicates(subset=["reg_s"], keep="last")
+            .set_index("reg_s")["calving_date"]
+            .to_dict()
+        )
+
+    def _is_pre_first_calving(reg: object) -> bool:
+        reg_s = str(reg or "")
+        if not reg_s:
+            return False
+        first_dt = full_first_calv_by_reg.get(reg_s)
+        return pd.isna(first_dt) or (pd.Timestamp(first_dt) > as_of_ts)
+
+    future_first_heifer_regs = {
+        str(reg)
+        for reg, first_dt in full_first_calv_by_reg.items()
+        if str(reg) and pd.notna(first_dt) and pd.Timestamp(first_dt) > as_of_ts
+    }
+
+    calv_hist = calv2[(calv2["calving_dt_n"].notna()) & (calv2["calving_dt_n"] <= as_of_ts)].copy()
+
+    calves_born = calv_hist[
+        (calv_hist["event_type_n"] == "РОЖДЕН")
+        & (calv_hist["mother_reg_s"] != "")
+        & (calv_hist["calving_dt_n"].notna())
+    ][["mother_reg_s", "calving_dt_n"]].drop_duplicates()
+    calves_otel = calv_hist[
+        (calv_hist["event_type_n"] == "ОТЕЛ")
+        & (calv_hist["reg_s"] != "")
+        & (calv_hist["calving_dt_n"].notna())
+    ][["reg_s", "calving_dt_n"]].drop_duplicates()
 
     calving_events_parts: list[pd.DataFrame] = []
     if not calves_born.empty:
         calving_events_parts.append(
-            calves_born.rename(columns={"mother_reg_s": "reg_s", "event_date_n": "calving_date"})
+            calves_born.rename(columns={"mother_reg_s": "reg_s", "calving_dt_n": "calving_date"})
         )
     if not calves_otel.empty:
         calving_events_parts.append(
-            calves_otel.rename(columns={"event_date_n": "calving_date"})
+            calves_otel.rename(columns={"calving_dt_n": "calving_date"})
         )
 
     calv_stats = None
@@ -1446,12 +1488,13 @@ def build_initial_state(
         & (ins["reg_s"] != "")
         & (ins["lact"] > 0)
     ].copy()
+    if future_first_heifer_regs:
+        ins_cow_hist = ins_cow_hist[~ins_cow_hist["reg_s"].isin(future_first_heifer_regs)].copy()
 
     est_stats = None
     if not ins_cow_hist.empty:
         ins_cow_hist = ins_cow_hist.sort_values(["reg_s", "event_date"], kind="mergesort")
         last_dim_row = ins_cow_hist.groupby("reg_s", sort=False).tail(1).copy()
-        last_dim_row["dim_age"] = pd.to_numeric(last_dim_row["dim_age"], errors="coerce")
         valid_dim = last_dim_row["dim_age"].notna() & (last_dim_row["dim_age"] >= 0)
         last_dim_row["last_calving_est"] = pd.NaT
         if bool(valid_dim.any()):
@@ -1462,40 +1505,84 @@ def build_initial_state(
         last_dim_row["lact_cat_est"] = last_dim_row["lact"].clip(lower=1, upper=4)
         est_stats = last_dim_row[["reg_s", "last_calving_est", "lact_cat_est", "dim_age"]].copy()
 
-    if calv_stats is None and est_stats is None:
+    dry_stats = None
+    if not dry_ok.empty:
+        dry_cow_hist = dry_ok.copy()
+        if future_first_heifer_regs:
+            dry_cow_hist = dry_cow_hist[~dry_cow_hist["reg_s"].isin(future_first_heifer_regs)].copy()
+        if not dry_cow_hist.empty:
+            dry_cow_hist = dry_cow_hist.sort_values(["reg_s", "event_date"], kind="mergesort")
+            last_dry_row = dry_cow_hist.groupby("reg_s", sort=False).tail(1).copy()
+            valid_dry_dim = last_dry_row["dim"].notna() & (last_dry_row["dim"] >= 0)
+            last_dry_row["last_calving_est"] = pd.NaT
+            if bool(valid_dry_dim.any()):
+                last_dry_row.loc[valid_dry_dim, "last_calving_est"] = (
+                    last_dry_row.loc[valid_dry_dim, "event_date"]
+                    - pd.to_timedelta(last_dry_row.loc[valid_dry_dim, "dim"], unit="D")
+                )
+            last_dry_row["lact_cat_est"] = 1
+            last_dry_row["dim_age"] = last_dry_row["dim"]
+            dry_stats = last_dry_row[["reg_s", "last_calving_est", "lact_cat_est", "dim_age"]].copy()
+
+    est_like_stats = None
+    if est_stats is not None:
+        est_like_stats = est_stats.set_index("reg_s")
+    if dry_stats is not None:
+        dry_like_stats = dry_stats.set_index("reg_s")
+        est_like_stats = (
+            est_like_stats.combine_first(dry_like_stats)
+            if est_like_stats is not None
+            else dry_like_stats
+        )
+    if est_like_stats is not None:
+        est_like_stats = est_like_stats.reset_index()
+
+    if calv_stats is None and est_like_stats is None:
         cows = pd.DataFrame(columns=["reg_s", "last_calving", "n_calvings", "last_calving_est", "lact_cat_est", "dim_age"])
     elif calv_stats is None:
-        cows = est_stats.copy()
+        cows = est_like_stats.copy()
         cows["n_calvings"] = pd.NA
-        cows["last_calving"] = pd.NA
-    elif est_stats is None:
+        cows["last_calving"] = pd.NaT
+    elif est_like_stats is None:
         cows = calv_stats.copy()
-        cows["last_calving_est"] = pd.NA
+        cows["last_calving_est"] = pd.NaT
         cows["lact_cat_est"] = pd.NA
         cows["dim_age"] = pd.NA
     else:
-        cows = calv_stats.merge(est_stats, on="reg_s", how="outer")
+        cows = calv_stats.merge(est_like_stats, on="reg_s", how="outer")
 
     cows = cows[(cows["reg_s"].notna()) & (cows["reg_s"] != "")].copy()
     cows = cows[~cows["reg_s"].isin(disposed_regs)].copy()
 
-                                                                                
-                                                                                        
     active_cow_regs = _estimate_active_cow_regs_at_asof(
-        calv=calv2,
+        calv=calv_hist,
         ins=ins,
         dry=dry,
         as_of_ts=as_of_ts,
         lookback_days=540,
+        first_calv_by_reg=full_first_calv_by_reg,
     )
-    if active_cow_regs:
-        cows_active = cows[cows["reg_s"].isin(active_cow_regs)].copy()
+    cow_last_calving_ref = pd.to_datetime(
+        cows["last_calving"].where(cows["last_calving"].notna(), cows["last_calving_est"]),
+        errors="coerce",
+    )
+    plausible_silent_cow_regs = set(
+        cows.loc[
+            cow_last_calving_ref.notna()
+            & (((as_of_ts - cow_last_calving_ref).dt.days) >= 0)
+            & (((as_of_ts - cow_last_calving_ref).dt.days) <= 720),
+            "reg_s",
+        ].astype(str).tolist()
+    )
+    keep_cow_regs = active_cow_regs | plausible_silent_cow_regs
+    if keep_cow_regs:
+        cows_active = cows[cows["reg_s"].isin(keep_cow_regs)].copy()
         if not cows_active.empty:
             cows = cows_active
 
     cows["last_calving"] = cows["last_calving"].where(cows["last_calving"].notna(), cows["last_calving_est"])
 
-    def _lcat(row) -> int:
+    def _lcat(row: pd.Series) -> int:
         if pd.notna(row.get("n_calvings")):
             return lact_cat_from_count(int(row["n_calvings"]))
         if pd.notna(row.get("lact_cat_est")):
@@ -1504,22 +1591,35 @@ def build_initial_state(
 
     cows["lact_cat"] = cows.apply(_lcat, axis=1)
     cows_regs = set(cows["reg_s"].astype(str).tolist())
-    cow_like_regs = _build_cow_like_regs(calv=calv2, ins=ins, dry=dry, cows_regs=cows_regs)
+    cow_like_regs = _build_cow_like_regs(
+        calv=calv_hist,
+        ins=ins,
+        dry=dry,
+        cows_regs=cows_regs,
+        first_calv_by_reg=full_first_calv_by_reg,
+        as_of_ts=as_of_ts,
+    )
 
-    ins_p = ins[
-        (ins["event_date"].notna())
-        & (ins["event_date"] <= as_of_ts)
-        & (ins["reg_s"] != "")
-        & (ins["result_norm"] == "P")
+    ins_p = infer_confirmed_conceptions(ins)
+    ins_p["concept_date"] = pd.to_datetime(ins_p.get("concept_date"), errors="coerce").dt.normalize()
+    ins_p["confirm_date"] = pd.to_datetime(ins_p.get("confirm_date"), errors="coerce").dt.normalize()
+    ins_p["lact_n"] = pd.to_numeric(ins_p.get("lact_n"), errors="coerce").fillna(0).astype(int)
+    ins_p["bull_s"] = ins_p.get("bull_s", "").astype("string").fillna("")
+    ins_p = ins_p[
+        (ins_p["concept_date"].notna())
+        & (ins_p["concept_date"] <= as_of_ts)
+        & (ins_p["reg_s"] != "")
     ].copy()
 
-    last_p: dict[str, pd.Timestamp] = {}
-    last_p_bull: dict[str, str] = {}
+    preg_rows_by_reg: dict[str, list[tuple[pd.Timestamp, str]]] = {}
     if not ins_p.empty:
-        ins_p = ins_p.sort_values(["reg_s", "event_date"], kind="mergesort")
-        tail = ins_p.groupby("reg_s", sort=False).tail(1)
-        last_p = dict(zip(tail["reg_s"], tail["event_date"]))
-        last_p_bull = dict(zip(tail["reg_s"], tail["bull_s"]))
+        ins_p = ins_p.sort_values(["reg_s", "concept_date", "confirm_date"], kind="mergesort")
+        for reg, g in ins_p.groupby("reg_s", sort=False):
+            preg_rows_by_reg[str(reg)] = [
+                (pd.Timestamp(rr.concept_date).normalize(), str(getattr(rr, "bull_s", "") or ""))
+                for rr in g.itertuples(index=False)
+                if pd.notna(getattr(rr, "concept_date", pd.NaT))
+            ]
 
     ins_params = insemination_params or {}
     cow_spc = float(ins_params.get("cow_services_per_conception", float(INSEMINATION_PARAMS.cow_services_per_conception)))
@@ -1530,55 +1630,43 @@ def build_initial_state(
     heifer_month_factors = _normalize_month_factor_map(
         ins_params.get("heifer_conception_month_factors", INSEMINATION_PARAMS.heifer_conception_month_factors)
     )
-
     p_conc_cow_base = 1.0 / max(1e-9, cow_spc)
-
-    p_conc_heif_raw = 1.0 / max(1e-9, heif_spc)
-    p_conc_heif_base = float(ins_params.get("heifer_warmstart_p", p_conc_heif_raw))
-
-    SERVICE_RESULTS = {"", "O", "О"}
+    p_conc_heif_base = float(ins_params.get("heifer_warmstart_p", 1.0 / max(1e-9, heif_spc)))
 
     last_service_cow: dict[str, pd.Timestamp] = {}
     last_service_bull_cow: dict[str, str] = {}
     last_service_heif: dict[str, pd.Timestamp] = {}
     last_service_bull_heif: dict[str, str] = {}
-
     if warmstart_from_services:
         ins_svc = ins[
             (ins["event_date"].notna())
             & (ins["event_date"] <= as_of_ts)
             & (ins["reg_s"] != "")
-            & (ins["result_norm"].isin(SERVICE_RESULTS))
+            & (ins["result_norm"].isin(SERVICE_RESULT_MARKERS))
         ].copy()
-
         ins_svc = ins_svc[~ins_svc["reg_s"].isin(disposed_regs)]
-
         if not ins_svc.empty:
             ins_svc = ins_svc.sort_values(["reg_s", "event_date"], kind="mergesort")
             last = ins_svc.groupby("reg_s", sort=False).tail(1)
-
-            cow_last = last[(last["lact"] > 0) | (last["reg_s"].isin(cow_like_regs))]
-            heif_last = last[(last["lact"] <= 0) & (~last["reg_s"].isin(cow_like_regs))]
-
+            pre_first_mask = last["reg_s"].map(_is_pre_first_calving)
+            cow_last = last[
+                (((last["lact"] > 0) | (last["reg_s"].isin(cow_like_regs))))
+                & (~pre_first_mask)
+            ]
+            heif_last = last[pre_first_mask]
             last_service_cow = dict(zip(cow_last["reg_s"], cow_last["event_date"]))
             last_service_bull_cow = dict(zip(cow_last["reg_s"], cow_last["bull_s"]))
-
             last_service_heif = dict(zip(heif_last["reg_s"], heif_last["event_date"]))
             last_service_bull_heif = dict(zip(heif_last["reg_s"], heif_last["bull_s"]))
 
-                                       
+    rows: list[dict[str, Any]] = []
+
     for r in cows.itertuples(index=False):
         reg = str(r.reg_s)
         lact_cat = int(r.lact_cat)
-
         last_calv = getattr(r, "last_calving", pd.NaT)
         dim_guess = getattr(r, "dim_age", pd.NA)
-
-        if pd.notna(last_calv):
-            dim = int(max(0, min(MAX_DIM, (as_of_ts - pd.Timestamp(last_calv).normalize()).days)))
-        else:
-            dim = int(max(0, min(MAX_DIM, float(dim_guess))) if pd.notna(dim_guess) else 0)
-
+        dim = int(max(0, min(MAX_DIM, (as_of_ts - pd.Timestamp(last_calv).normalize()).days))) if pd.notna(last_calv) else int(max(0, min(MAX_DIM, float(dim_guess))) if pd.notna(dim_guess) else 0)
         dry_last_dt = dry_last.get(reg, pd.NaT)
         is_dry_fact = (
             pd.notna(dry_last_dt)
@@ -1586,189 +1674,434 @@ def build_initial_state(
             and (pd.Timestamp(dry_last_dt) > pd.Timestamp(last_calv))
         )
 
-        open_add = 1.0
-        placed_preg = False
+        row = {
+            "reg_s": reg,
+            "group_code": "Дойные коровы",
+            "basis": "open",
+            "lact_cat": lact_cat,
+            "dim": dim,
+            "age_days": pd.NA,
+            "semen": "trad",
+            "days_to_calv": pd.NA,
+            "cow_open_weight": 1.0,
+            "cow_preg_lact_weight": 0.0,
+            "cow_preg_dry_weight": 0.0,
+            "heifer_preg_weight": 0.0,
+            "heifer_open_weight": 0.0,
+            "last_calving": pd.Timestamp(last_calv).normalize() if pd.notna(last_calv) else pd.NaT,
+            "last_dry": pd.Timestamp(dry_last_dt).normalize() if pd.notna(dry_last_dt) else pd.NaT,
+            "first_calving": pd.Timestamp(full_first_calv_by_reg.get(reg)).normalize() if pd.notna(full_first_calv_by_reg.get(reg)) else pd.NaT,
+        }
 
-        p_date = last_p.get(reg, pd.NaT)
-        bull = last_p_bull.get(reg, "") or ""
+        p_date = pd.NaT
+        bull = ""
+        for cand_dt, cand_bull in reversed(preg_rows_by_reg.get(reg, [])):
+            if pd.notna(last_calv) and cand_dt <= pd.Timestamp(last_calv).normalize():
+                continue
+            p_date = cand_dt
+            bull = cand_bull or ""
+            break
         semen = semen_by_bull.get(bull, "trad") if bull else "trad"
 
         if pd.notna(p_date):
             p_date = pd.Timestamp(p_date).normalize()
-            if not (pd.notna(last_calv) and p_date <= pd.Timestamp(last_calv).normalize()):
-                days_to_calv = int(gest_days - (as_of_ts - p_date).days)
-                if days_to_calv < 0 and days_to_calv >= -OVERDUE_CLAMP_DAYS:
-                    days_to_calv = 0
-                if 0 <= days_to_calv <= gest_days:
-                    is_dry = is_dry_fact or (days_to_calv <= dry_days)
-                    if is_dry:
-                        state.preg_dry[(lact_cat, semen)][days_to_calv] += 1.0
-                    else:
-                        state.preg_lact[(lact_cat, semen)][days_to_calv] += 1.0
-                    open_add = 0.0
-                    placed_preg = True
+            days_to_calv = int(gest_days - (as_of_ts - p_date).days)
+            if days_to_calv < 0 and days_to_calv >= -OVERDUE_CLAMP_DAYS:
+                days_to_calv = 0
+            if 0 <= days_to_calv <= gest_days:
+                row["semen"] = semen
+                row["days_to_calv"] = days_to_calv
+                row["cow_open_weight"] = 0.0
+                if is_dry_fact:
+                    row["group_code"] = "Сухостойные коровы"
+                    row["basis"] = "confirmed_p+dry"
+                    row["cow_preg_dry_weight"] = 1.0
+                else:
+                    row["group_code"] = "Дойные коровы"
+                    row["basis"] = "confirmed_p"
+                    row["cow_preg_lact_weight"] = 1.0
+                rows.append(row)
+                continue
 
-        if warmstart_from_services and (not placed_preg):
+        if is_dry_fact:
+            dry_days_to_calv = int(dry_days - (as_of_ts - pd.Timestamp(dry_last_dt).normalize()).days)
+            if dry_days_to_calv < 0 and dry_days_to_calv >= -OVERDUE_CLAMP_DAYS:
+                dry_days_to_calv = 0
+            dry_days_to_calv = int(_clamp(float(dry_days_to_calv), 0.0, float(dry_days)))
+            row["group_code"] = "Сухостойные коровы"
+            row["basis"] = "factual_dry"
+            row["days_to_calv"] = dry_days_to_calv
+            row["semen"] = semen_by_bull.get(last_service_bull_cow.get(reg, "") or bull or "", "trad")
+            row["cow_open_weight"] = 0.0
+            row["cow_preg_dry_weight"] = 1.0
+            rows.append(row)
+            continue
+
+        if warmstart_from_services:
             s_date = last_service_cow.get(reg, pd.NaT)
             if pd.notna(s_date):
                 s_date = pd.Timestamp(s_date).normalize()
                 if not (pd.notna(last_calv) and s_date <= pd.Timestamp(last_calv).normalize()):
                     bull2 = last_service_bull_cow.get(reg, "") or ""
                     semen2 = semen_by_bull.get(bull2, "trad") if bull2 else "trad"
-
                     days_to_calv2 = int(gest_days - (as_of_ts - s_date).days)
                     if days_to_calv2 < 0 and days_to_calv2 >= -OVERDUE_CLAMP_DAYS:
                         days_to_calv2 = 0
-
                     if 0 <= days_to_calv2 <= gest_days:
-                        month_factor = _month_factor_value(cow_month_factors, s_date)
-                        add = _clamp(p_conc_cow_base * month_factor, 0.05, 0.95)
-                        open_add = 1.0 - add
-                        is_dry2 = is_dry_fact or (days_to_calv2 <= dry_days)
-                        if is_dry2:
-                            state.preg_dry[(lact_cat, semen2)][days_to_calv2] += add
-                        else:
-                            state.preg_lact[(lact_cat, semen2)][days_to_calv2] += add
+                        add = _clamp(p_conc_cow_base * _month_factor_value(cow_month_factors, s_date), 0.05, 0.95)
+                        row["basis"] = "service_warmstart"
+                        row["semen"] = semen2
+                        row["days_to_calv"] = days_to_calv2
+                        row["cow_open_weight"] = 1.0 - add
+                        row["cow_preg_lact_weight"] = add
 
-        state.open_dim[lact_cat][dim] += open_add
+        rows.append(row)
 
-                                                                  
-                                                                     
-                                                                  
-
-    heifer_p = ins[
-        (ins["event_date"].notna())
-        & (ins["event_date"] <= as_of_ts)
-        & (ins["reg_s"] != "")
-        & (ins["lact"] <= 0)
-        & (ins["result_norm"] == "P")
-        & (~ins["reg_s"].isin(cow_like_regs))
-        & (~ins["reg_s"].isin(disposed_regs))
+    heifer_p = ins_p[
+        (ins_p["concept_date"].notna())
+        & (ins_p["concept_date"] <= as_of_ts)
+        & (ins_p["reg_s"] != "")
+        & ins_p["reg_s"].map(_is_pre_first_calving)
+        & (~ins_p["reg_s"].isin(disposed_regs))
     ].copy()
-
-    p_regs = set()
-    heifer_last = None
+    p_regs: set[str] = set()
     if not heifer_p.empty:
-        heifer_p = heifer_p.sort_values(["reg_s", "event_date"], kind="mergesort")
+        heifer_p = heifer_p.sort_values(["reg_s", "concept_date", "confirm_date"], kind="mergesort")
         heifer_last = heifer_p.groupby("reg_s", sort=False).tail(1)
         p_regs = set(heifer_last["reg_s"].astype(str).tolist())
-
         for rr in heifer_last.itertuples(index=False):
-            p_date = rr.event_date
+            p_date = rr.concept_date
             if pd.isna(p_date):
                 continue
             bull = getattr(rr, "bull_s", "") or ""
             semen = semen_by_bull.get(bull, "trad") if bull else "trad"
-
             p_date = pd.Timestamp(p_date).normalize()
             days_to_calv = int(gest_days - (as_of_ts - p_date).days)
             if days_to_calv < 0 and days_to_calv >= -OVERDUE_CLAMP_DAYS:
                 days_to_calv = 0
             if 0 <= days_to_calv <= gest_days:
-                state.heifer_preg[semen][days_to_calv] += 1.0
+                rows.append(
+                    {
+                        "reg_s": str(rr.reg_s),
+                        "group_code": "Нетели",
+                        "basis": "confirmed_first_p",
+                        "lact_cat": 0,
+                        "dim": pd.NA,
+                        "age_days": pd.NA,
+                        "semen": semen,
+                        "days_to_calv": days_to_calv,
+                        "cow_open_weight": 0.0,
+                        "cow_preg_lact_weight": 0.0,
+                        "cow_preg_dry_weight": 0.0,
+                        "heifer_preg_weight": 1.0,
+                        "heifer_open_weight": 0.0,
+                        "last_calving": pd.NaT,
+                        "last_dry": pd.NaT,
+                        "first_calving": pd.Timestamp(full_first_calv_by_reg.get(str(rr.reg_s))).normalize() if pd.notna(full_first_calv_by_reg.get(str(rr.reg_s))) else pd.NaT,
+                    }
+                )
 
-    if warmstart_from_services and last_service_heif:
+    future_neteli_regs = {
+        str(reg)
+        for reg, first_dt in full_first_calv_by_reg.items()
+        if str(reg)
+        and pd.notna(first_dt)
+        and (pd.Timestamp(first_dt) > as_of_ts)
+        and (pd.Timestamp(first_dt) <= as_of_ts + pd.Timedelta(days=gest_days))
+        and str(reg) not in disposed_regs
+        and str(reg) not in p_regs
+    }
+    for reg in future_neteli_regs:
+        first_dt = full_first_calv_by_reg.get(reg)
+        if pd.isna(first_dt):
+            continue
+        days_to_calv = int((pd.Timestamp(first_dt).normalize() - as_of_ts).days)
+        if 0 <= days_to_calv <= gest_days:
+            rows.append(
+                {
+                    "reg_s": reg,
+                    "group_code": "Нетели",
+                    "basis": "future_first_calving",
+                    "lact_cat": 0,
+                    "dim": pd.NA,
+                    "age_days": pd.NA,
+                    "semen": "trad",
+                    "days_to_calv": days_to_calv,
+                    "cow_open_weight": 0.0,
+                    "cow_preg_lact_weight": 0.0,
+                    "cow_preg_dry_weight": 0.0,
+                    "heifer_preg_weight": 1.0,
+                    "heifer_open_weight": 0.0,
+                    "last_calving": pd.NaT,
+                    "last_dry": pd.NaT,
+                    "first_calving": pd.Timestamp(first_dt).normalize(),
+                }
+            )
+
+    if warmstart_from_services and bool(ins_params.get("enable_heifer_service_warmstart", False)) and last_service_heif:
         for reg, s_date in last_service_heif.items():
-            if reg in disposed_regs or reg in cow_like_regs or reg in p_regs:
+            if reg in disposed_regs or reg in p_regs or reg in future_neteli_regs:
+                continue
+            if (reg in cow_like_regs) and (not _is_pre_first_calving(reg)):
                 continue
             if pd.isna(s_date):
                 continue
             bull = last_service_bull_heif.get(reg, "") or ""
             semen = semen_by_bull.get(bull, "trad") if bull else "trad"
-
             s_date = pd.Timestamp(s_date).normalize()
             days_to_calv = int(gest_days - (as_of_ts - s_date).days)
             if days_to_calv < 0 and days_to_calv >= -OVERDUE_CLAMP_DAYS:
                 days_to_calv = 0
             if not (0 <= days_to_calv <= gest_days):
                 continue
+            add = _clamp(p_conc_heif_base * _month_factor_value(heifer_month_factors, s_date), 0.03, 0.35)
+            rows.append(
+                {
+                    "reg_s": reg,
+                    "group_code": "Нетели",
+                    "basis": "heifer_service_warmstart",
+                    "lact_cat": 0,
+                    "dim": pd.NA,
+                    "age_days": pd.NA,
+                    "semen": semen,
+                    "days_to_calv": days_to_calv,
+                    "cow_open_weight": 0.0,
+                    "cow_preg_lact_weight": 0.0,
+                    "cow_preg_dry_weight": 0.0,
+                    "heifer_preg_weight": add,
+                    "heifer_open_weight": 0.0,
+                    "last_calving": pd.NaT,
+                    "last_dry": pd.NaT,
+                    "first_calving": pd.Timestamp(full_first_calv_by_reg.get(reg)).normalize() if pd.notna(full_first_calv_by_reg.get(reg)) else pd.NaT,
+                }
+            )
 
-            month_factor = _month_factor_value(heifer_month_factors, s_date)
-            add = _clamp(p_conc_heif_base * month_factor, 0.03, 0.35)
-            state.heifer_preg[semen][days_to_calv] += add
-
-                                                                  
-                                                        
-                                                              
-                                                                  
-
-    if semen_sex_ratios is None:
-        semen_sex_ratios = {
-            "trad": _to_semen_ratio(SEMEN_SEX_RATIOS["trad"]),
-            "sex": _to_semen_ratio(SEMEN_SEX_RATIOS["sex"]),
-        }
-
-    seed_days = int(float(ins_params.get("youngstock_seed_days", 540) or 540))
-    seed_days = max(120, min(seed_days, int(MAX_AGE_DAYS)))                    
-
-    calv_seed = calv.copy()
-    calv_seed["event_date_n"] = pd.to_datetime(calv_seed["event_date"], errors="coerce").dt.normalize()
-    calv_seed = calv_seed[
-        (calv_seed["event_date_n"].notna())
-        & (calv_seed["event_date_n"] <= as_of_ts)
-        & (calv_seed["event_date_n"] >= (as_of_ts - pd.Timedelta(days=seed_days)))
-    ].copy()
-
-    calv_seed["reg_s"] = calv_seed["reg"].apply(norm_id)
-    calv_seed = calv_seed[~calv_seed["reg_s"].isin(p_regs)]
-    calv_seed = calv_seed[~calv_seed["reg_s"].isin(cow_like_regs)]
-
-    _seed_youngstock_from_calvings(
-        state=state,
-        calv=calv_seed,
-        ins=ins,
-        semen_by_bull=semen_by_bull,
-        semen_sex_ratios=semen_sex_ratios,
-        disposed_regs=disposed_regs,
-        as_of_ts=as_of_ts,
-        gest_days=gest_days,
-        cow_like_regs=(cow_like_regs | p_regs),
-    )
-
-                                                                  
-                                                                  
-
-    born_known = 0
-    if not calv_seed.empty:
-        tmp = calv_seed.copy()
-        tmp["event_type_n"] = tmp["event_type"].apply(norm_event_type)
-        tmp["reg_s"] = tmp["reg"].apply(norm_id)
-        born_known = int(((tmp["event_type_n"] == "РОЖДЕН") & (tmp["reg_s"] != "")).sum())
-
-    if born_known < 10:
-        heif_any = ins[
-            (ins["event_date"].notna())
-            & (ins["event_date"] <= as_of_ts)
-            & (ins["reg_s"] != "")
-            & (ins["lact"] <= 0)
-            & (~ins["reg_s"].isin(cow_like_regs))
-            & (~ins["reg_s"].isin(disposed_regs))
-            & (~ins["reg_s"].isin(p_regs))
+    calf_births = _extract_calf_births(calv, as_of_ts)
+    if not calf_births.empty:
+        calf_births["age_days"] = (as_of_ts - pd.to_datetime(calf_births["birth_dt"], errors="coerce")).dt.days
+        calf_births = calf_births[
+            calf_births["reg_s"].notna()
+            & (calf_births["reg_s"] != "")
+            & (~calf_births["reg_s"].isin(disposed_regs))
         ].copy()
+        excluded_regs = set(cows["reg_s"].astype(str).tolist()) | set(p_regs) | set(future_neteli_regs)
+        calf_births = calf_births[~calf_births["reg_s"].astype(str).isin(excluded_regs)].copy()
+        female_births = calf_births[
+            (calf_births["sex_norm"] == "F")
+            & (calf_births["age_days"] >= 0)
+            & (calf_births["age_days"] < MAX_AGE_DAYS)
+        ].copy()
+        if not female_births.empty:
+            female_births = (
+                female_births.sort_values(["reg_s", "birth_dt"], kind="mergesort")
+                .drop_duplicates(subset=["reg_s"], keep="last")
+            )
+            for rr in female_births.itertuples(index=False):
+                age_days = int(rr.age_days)
+                if age_days < 90:
+                    group_code = "Тёлки 0–3 мес"
+                elif age_days < 270:
+                    group_code = "Тёлки 3–8 мес"
+                else:
+                    group_code = "Тёлки ≥9 мес"
+                rows.append(
+                    {
+                        "reg_s": str(rr.reg_s),
+                        "group_code": group_code,
+                        "basis": "birth_age",
+                        "lact_cat": 0,
+                        "dim": pd.NA,
+                        "age_days": age_days,
+                        "semen": "trad",
+                        "days_to_calv": pd.NA,
+                        "cow_open_weight": 0.0,
+                        "cow_preg_lact_weight": 0.0,
+                        "cow_preg_dry_weight": 0.0,
+                        "heifer_preg_weight": 0.0,
+                        "heifer_open_weight": 1.0,
+                        "bull_weight": 0.0,
+                        "last_calving": pd.NaT,
+                        "last_dry": pd.NaT,
+                        "first_calving": pd.Timestamp(full_first_calv_by_reg.get(str(rr.reg_s))).normalize() if pd.notna(full_first_calv_by_reg.get(str(rr.reg_s))) else pd.NaT,
+                    }
+                )
 
-        if not heif_any.empty:
-            heif_any = heif_any.sort_values(["reg_s", "event_date"], kind="mergesort")
-            last = heif_any.groupby("reg_s", sort=False).tail(1)
+        male_births = calf_births[
+            (calf_births["sex_norm"] == "M")
+            & (calf_births["age_days"] >= 0)
+            & (calf_births["age_days"] < 61)
+        ].copy()
+        if not male_births.empty:
+            male_births = (
+                male_births.sort_values(["reg_s", "birth_dt"], kind="mergesort")
+                .drop_duplicates(subset=["reg_s"], keep="last")
+            )
+            for rr in male_births.itertuples(index=False):
+                rows.append(
+                    {
+                        "reg_s": str(rr.reg_s),
+                        "group_code": "Бычки 0–2 мес",
+                        "basis": "birth_age",
+                        "lact_cat": 0,
+                        "dim": pd.NA,
+                        "age_days": int(rr.age_days),
+                        "semen": "trad",
+                        "days_to_calv": pd.NA,
+                        "cow_open_weight": 0.0,
+                        "cow_preg_lact_weight": 0.0,
+                        "cow_preg_dry_weight": 0.0,
+                        "heifer_preg_weight": 0.0,
+                        "heifer_open_weight": 0.0,
+                        "bull_weight": 1.0,
+                        "last_calving": pd.NaT,
+                        "last_dry": pd.NaT,
+                        "first_calving": pd.NaT,
+                    }
+                )
 
-            for rr in last.itertuples(index=False):
-                age_val = getattr(rr, "dim_age", np.nan)
-                if pd.isna(age_val):
-                    continue
-                age_val = float(age_val)
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(
+            columns=[
+                "reg_s",
+                "group_code",
+                "basis",
+                "lact_cat",
+                "dim",
+                "age_days",
+                "semen",
+                "days_to_calv",
+                "cow_open_weight",
+                "cow_preg_lact_weight",
+                "cow_preg_dry_weight",
+                "heifer_preg_weight",
+                "heifer_open_weight",
+                "bull_weight",
+                "last_calving",
+                "last_dry",
+                "first_calving",
+            ]
+        )
 
-                if age_val < 150 or age_val > MAX_AGE_DAYS:
-                    continue
+    out["reg_s"] = out["reg_s"].astype(str)
+    return out.sort_values(["group_code", "reg_s"], kind="mergesort").reset_index(drop=True)
 
-                age = int(max(0, min(MAX_AGE_DAYS, int(age_val))))
-                state.heifer_age[age] += 1.0
 
-    _warmstart_heifer_preg_from_stock_if_empty(
-        state=state,
-        ins_params=ins_params,
-        gest_days=gest_days,
-    )
+def _state_from_animal_asof_snapshot(snapshot: pd.DataFrame, gest_days: int) -> HerdState:
+    state = init_empty_state(gest_days)
+    if not isinstance(snapshot, pd.DataFrame) or snapshot.empty:
+        return state
+
+    work = snapshot.copy()
+    work["lact_cat"] = pd.to_numeric(work.get("lact_cat"), errors="coerce").fillna(0).astype(int)
+    work["dim"] = pd.to_numeric(work.get("dim"), errors="coerce")
+    work["age_days"] = pd.to_numeric(work.get("age_days"), errors="coerce")
+    work["days_to_calv"] = pd.to_numeric(work.get("days_to_calv"), errors="coerce")
+    work["bull_weight"] = pd.to_numeric(work.get("bull_weight"), errors="coerce").fillna(0.0)
+
+    for rr in work.itertuples(index=False):
+        lact_cat = int(getattr(rr, "lact_cat", 0) or 0)
+        if lact_cat > 0:
+            dim = int(_clamp(float(getattr(rr, "dim", 0) or 0), 0.0, float(MAX_DIM)))
+            semen = str(getattr(rr, "semen", "trad") or "trad")
+            if semen not in {"trad", "sex"}:
+                semen = "trad"
+            days_to_calv = int(_clamp(float(getattr(rr, "days_to_calv", 0) or 0), 0.0, float(gest_days)))
+            open_w = float(getattr(rr, "cow_open_weight", 0.0) or 0.0)
+            preg_l_w = float(getattr(rr, "cow_preg_lact_weight", 0.0) or 0.0)
+            preg_d_w = float(getattr(rr, "cow_preg_dry_weight", 0.0) or 0.0)
+            if open_w > 0:
+                state.open_dim[lact_cat][dim] += open_w
+            if preg_l_w > 0:
+                state.preg_lact[(lact_cat, semen)][days_to_calv] += preg_l_w
+            if preg_d_w > 0:
+                state.preg_dry[(lact_cat, semen)][days_to_calv] += preg_d_w
+            continue
+
+        heifer_preg_w = float(getattr(rr, "heifer_preg_weight", 0.0) or 0.0)
+        heifer_open_w = float(getattr(rr, "heifer_open_weight", 0.0) or 0.0)
+        semen = str(getattr(rr, "semen", "trad") or "trad")
+        if semen not in {"trad", "sex"}:
+            semen = "trad"
+        if heifer_preg_w > 0:
+            days_to_calv = int(_clamp(float(getattr(rr, "days_to_calv", 0) or 0), 0.0, float(gest_days)))
+            state.heifer_preg[semen][days_to_calv] += heifer_preg_w
+        if heifer_open_w > 0:
+            age_days = int(_clamp(float(getattr(rr, "age_days", 0) or 0), 0.0, float(MAX_AGE_DAYS)))
+            state.heifer_age[age_days] += heifer_open_w
+        bull_w = float(getattr(rr, "bull_weight", 0.0) or 0.0)
+        if bull_w > 0:
+            age_days = int(_clamp(float(getattr(rr, "age_days", 0) or 0), 0.0, float(BULL_AGE_MAX)))
+            state.bull_age[age_days] += bull_w
 
     return state
+
+
+def animal_asof_snapshot_group_totals(snapshot: pd.DataFrame) -> Dict[str, float]:
+    base = {
+        "Дойные коровы": 0.0,
+        "Сухостойные коровы": 0.0,
+        "Тёлки 0–3 мес": 0.0,
+        "Бычки 0–2 мес": 0.0,
+        "Тёлки 3–8 мес": 0.0,
+        "Тёлки ≥9 мес": 0.0,
+        "Нетели": 0.0,
+    }
+    if not isinstance(snapshot, pd.DataFrame) or snapshot.empty:
+        return base
+
+    work = snapshot.copy()
+    work["cow_open_weight"] = pd.to_numeric(work.get("cow_open_weight"), errors="coerce").fillna(0.0)
+    work["cow_preg_lact_weight"] = pd.to_numeric(work.get("cow_preg_lact_weight"), errors="coerce").fillna(0.0)
+    work["cow_preg_dry_weight"] = pd.to_numeric(work.get("cow_preg_dry_weight"), errors="coerce").fillna(0.0)
+    work["heifer_preg_weight"] = pd.to_numeric(work.get("heifer_preg_weight"), errors="coerce").fillna(0.0)
+    work["heifer_open_weight"] = pd.to_numeric(work.get("heifer_open_weight"), errors="coerce").fillna(0.0)
+    work["bull_weight"] = pd.to_numeric(work.get("bull_weight"), errors="coerce").fillna(0.0)
+    work["age_days"] = pd.to_numeric(work.get("age_days"), errors="coerce")
+
+    base["Дойные коровы"] = float((work["cow_open_weight"] + work["cow_preg_lact_weight"]).sum())
+    base["Сухостойные коровы"] = float(work["cow_preg_dry_weight"].sum())
+    base["Нетели"] = float(work["heifer_preg_weight"].sum())
+    base["Тёлки 0–3 мес"] = float(work.loc[(work["age_days"] >= 0) & (work["age_days"] < 90), "heifer_open_weight"].sum())
+    base["Бычки 0–2 мес"] = float(work.loc[(work["age_days"] >= 0) & (work["age_days"] < 61), "bull_weight"].sum())
+    base["Тёлки 3–8 мес"] = float(work.loc[(work["age_days"] >= 90) & (work["age_days"] < 270), "heifer_open_weight"].sum())
+    base["Тёлки ≥9 мес"] = float(work.loc[work["age_days"] >= 270, "heifer_open_weight"].sum())
+    return base
+
+
+def snapshot_groups_on_asof_from_tables(
+    tables: Dict[str, pd.DataFrame],
+    as_of: date,
+    *,
+    gest_days: int | None = None,
+    dry_days: int | None = None,
+    insemination_params: dict | None = None,
+    semen_sex_ratios: Dict[str, SemenSexRatio] | None = None,
+    warmstart_from_services: bool = False,
+) -> Dict[str, float]:
+    def _frame(name: str, columns: list[str]) -> pd.DataFrame:
+        df = tables.get(name, pd.DataFrame()) if isinstance(tables, dict) else pd.DataFrame()
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+        return df.reindex(columns=columns).copy()
+
+    norm_tables = {
+        "calv": _frame("calv", ["reg", "mother_reg", "birth_date", "sex", "event_type", "event_date"]),
+        "ins": _frame("ins", ["reg", "lact", "dim_age", "event_date", "bull", "result"]),
+        "dry": _frame("dry", ["reg", "dim", "event_date"]),
+        "disp": _frame("disp", ["reg", "event_date", "disposal_reason"]),
+        "bulls": _frame("bulls", ["bull_code", "bull_type"]),
+    }
+    state = build_initial_state(
+        norm_tables,
+        as_of=as_of,
+        gest_days=gest_days,
+        dry_days=dry_days,
+        insemination_params=insemination_params,
+        warmstart_from_services=warmstart_from_services,
+        semen_sex_ratios=semen_sex_ratios,
+    )
+    return _state_group_snapshot(state)
 
 import pandas as pd
 import numpy as np
@@ -1862,6 +2195,8 @@ def simulate_to_target(
     cp = params["CONCEPTION_PARAMS"]
     disp_params = params["DISPOSAL_PARAMS"]
     annual_disp = float(params["ANNUAL_DISPOSAL_RATE"])
+    heifer_precalving_disp = float(params.get("HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE", annual_disp))
+    bull_calf_exit = float(params.get("BULL_CALF_DAILY_EXIT_RATE", 0.0))
     ins_p = params["INSEMINATION_PARAMS"]
 
     target_month = (int(target_ts.year), int(target_ts.month))
@@ -1876,7 +2211,26 @@ def simulate_to_target(
         "heifer_doses_total": 0.0, "heifer_doses_sex": 0.0, "heifer_doses_trad": 0.0,
         "sell_cows": 0.0, "sell_heifers": 0.0, "sell_neteli": 0.0,
         "over_doy": 0.0, "over_dry": 0.0, "over_h0": 0.0, "over_h38": 0.0, "over_h9": 0.0, "over_neteli": 0.0,
+        "start_doy": 0.0, "start_dry": 0.0, "start_h0": 0.0, "start_h38": 0.0, "start_h9": 0.0, "start_neteli": 0.0,
+        "start_b0": 0.0,
+        "flow_birth_female_total": 0.0, "flow_birth_male_total": 0.0,
+        "flow_h0_to_h38": 0.0, "flow_h38_to_h9": 0.0, "flow_b0_to_out": 0.0,
+        "flow_doy_to_dry": 0.0, "flow_dry_to_doy": 0.0, "flow_neteli_to_doy": 0.0, "flow_h9_to_neteli": 0.0,
+        "disp_doy_total": 0.0, "disp_dry_total": 0.0,
+        "disp_h9_total": 0.0, "disp_neteli_total": 0.0,
+        "preg_loss_cows_total": 0.0, "preg_loss_heifers_total": 0.0,
+        "sell_cows_total": 0.0, "sell_cows_doy_total": 0.0, "sell_cows_dry_total": 0.0,
+        "sell_heifers_total": 0.0, "sell_heifers_h0_total": 0.0, "sell_heifers_h38_total": 0.0, "sell_heifers_h9_total": 0.0,
+        "sell_neteli_total": 0.0,
     }
+    start_snapshot = _state_group_snapshot(state)
+    meta["start_doy"] = float(start_snapshot["Дойные коровы"])
+    meta["start_dry"] = float(start_snapshot["Сухостойные коровы"])
+    meta["start_h0"] = float(start_snapshot["Тёлки 0–3 мес"])
+    meta["start_h38"] = float(start_snapshot["Тёлки 3–8 мес"])
+    meta["start_h9"] = float(start_snapshot["Тёлки ≥9 мес"])
+    meta["start_neteli"] = float(start_snapshot["Нетели"])
+    meta["start_b0"] = float(start_snapshot["Бычки 0–2 мес"])
 
     def _process_bucket0_for_day(curr_day_ts: pd.Timestamp) -> None:
         nonlocal calv_total, calv_cows, calv_heifers, exp_bulls, exp_heifers
@@ -1885,6 +2239,27 @@ def simulate_to_target(
 
         for l in (1, 2, 3, 4):
             for semen in ("trad", "sex"):
+                born_lact = float(state.preg_lact[(l, semen)][0])
+                if born_lact > 0:
+                    state.preg_lact[(l, semen)][0] = 0.0
+
+                    if curr_month == target_month:
+                        calv_total += born_lact
+                        calv_cows += born_lact
+                        sr = semen_sex_ratios[semen]
+                        exp_bulls += born_lact * float(sr.bull_share)
+                        exp_heifers += born_lact * float(sr.heifer_share)
+                    meta["flow_dry_to_doy"] += born_lact
+
+                    l2 = min(4, l + 1)
+                    state.open_dim[l2][0] += born_lact
+
+                    sr = semen_sex_ratios[semen]
+                    state.heifer_age[0] += born_lact * float(sr.heifer_share)
+                    state.bull_age[0] += born_lact * float(sr.bull_share)
+                    meta["flow_birth_female_total"] += born_lact * float(sr.heifer_share)
+                    meta["flow_birth_male_total"] += born_lact * float(sr.bull_share)
+
                 born = float(state.preg_dry[(l, semen)][0])
                 if born > 0:
                     state.preg_dry[(l, semen)][0] = 0.0
@@ -1895,6 +2270,7 @@ def simulate_to_target(
                         sr = semen_sex_ratios[semen]
                         exp_bulls += born * float(sr.bull_share)
                         exp_heifers += born * float(sr.heifer_share)
+                    meta["flow_dry_to_doy"] += born
 
                     l2 = min(4, l + 1)
                     state.open_dim[l2][0] += born
@@ -1902,6 +2278,8 @@ def simulate_to_target(
                     sr = semen_sex_ratios[semen]
                     state.heifer_age[0] += born * float(sr.heifer_share)
                     state.bull_age[0] += born * float(sr.bull_share)
+                    meta["flow_birth_female_total"] += born * float(sr.heifer_share)
+                    meta["flow_birth_male_total"] += born * float(sr.bull_share)
 
         for semen in ("trad", "sex"):
             born = float(state.heifer_preg[semen][0])
@@ -1914,11 +2292,14 @@ def simulate_to_target(
                     sr = semen_sex_ratios[semen]
                     exp_bulls += born * float(sr.bull_share)
                     exp_heifers += born * float(sr.heifer_share)
+                meta["flow_neteli_to_doy"] += born
 
                 state.open_dim[1][0] += born
                 sr = semen_sex_ratios[semen]
                 state.heifer_age[0] += born * float(sr.heifer_share)
                 state.bull_age[0] += born * float(sr.bull_share)
+                meta["flow_birth_female_total"] += born * float(sr.heifer_share)
+                meta["flow_birth_male_total"] += born * float(sr.bull_share)
 
     _process_bucket0_for_day(start_ts)
                                                                      
@@ -1939,8 +2320,21 @@ def simulate_to_target(
             meta["over_h38"] += float(sold0["over_h38"])
             meta["over_h9"] += float(sold0["over_h9"])
             meta["over_neteli"] += float(sold0["over_neteli"])
+        meta["sell_cows_total"] += float(sold0.get("sell_cows", 0.0))
+        meta["sell_cows_doy_total"] += float(sold0.get("sell_cows_doy", 0.0))
+        meta["sell_cows_dry_total"] += float(sold0.get("sell_cows_dry", 0.0))
+        meta["sell_heifers_total"] += float(sold0.get("sell_heifers", 0.0))
+        meta["sell_heifers_h0_total"] += float(sold0.get("sell_heifers_h0", 0.0))
+        meta["sell_heifers_h38_total"] += float(sold0.get("sell_heifers_h38", 0.0))
+        meta["sell_heifers_h9_total"] += float(sold0.get("sell_heifers_h9", 0.0))
+        meta["sell_neteli_total"] += float(sold0.get("sell_neteli", 0.0))
 
     p_disp_day_base = 1.0 - (1.0 - annual_disp) ** (1.0 / 365.0)
+    p_disp_day_heifer = 1.0 - (1.0 - heifer_precalving_disp) ** (1.0 / 365.0)
+    cow_preg_loss_rate = float(max(0.0, min(0.5, ins_p.get("cow_pregnancy_loss_rate", 0.0))))
+    heifer_preg_loss_rate = float(max(0.0, min(0.5, ins_p.get("heifer_pregnancy_loss_rate", 0.0))))
+    p_preg_loss_day_cow = 1.0 - (1.0 - cow_preg_loss_rate) ** (1.0 / max(1.0, float(gest_days)))
+    p_preg_loss_day_heifer = 1.0 - (1.0 - heifer_preg_loss_rate) ** (1.0 / max(1.0, float(gest_days)))
     disp_shape = build_disposal_shape(disp_params)
 
     by_lact = disp_params.get("by_lact", {})
@@ -1971,6 +2365,13 @@ def simulate_to_target(
     while day < end_sim_ts:
         day = (day + pd.Timedelta(days=1)).normalize()
 
+        if len(state.heifer_age) > 89:
+            meta["flow_h0_to_h38"] += float(state.heifer_age[89])
+        if len(state.heifer_age) > 269:
+            meta["flow_h38_to_h9"] += float(state.heifer_age[269])
+        if len(state.bull_age) > 60:
+            meta["flow_b0_to_out"] += float(state.bull_age[60])
+
         for l in (1, 2, 3, 4):
             state.open_dim[l] = shift_right(state.open_dim[l])
         state.heifer_age = shift_right(state.heifer_age)
@@ -1989,6 +2390,7 @@ def simulate_to_target(
                 if move > 0:
                     state.preg_lact[(l, semen)][idx_dry] = 0.0
                     state.preg_dry[(l, semen)][idx_dry] += move
+                    meta["flow_doy_to_dry"] += move
 
         _process_bucket0_for_day(day)
 
@@ -2045,6 +2447,17 @@ def simulate_to_target(
         if first_h < len(state.heifer_age):
             eligible_h = state.heifer_age.copy()
             eligible_h[:first_h] = 0.0
+            # Do not inseminate the entire old tail of open heifers equally.
+            # Keep the active window around the observed mean conception age.
+            heifer_active_hi = int(
+                _clamp(
+                    max(float(first_ai_age) + 30.0, float(mean_target_h) + max(45.0, float(interval_h) * max(1.0, float(spc_h)))),
+                    0.0,
+                    float(MAX_AGE_DAYS),
+                )
+            )
+            if heifer_active_hi + 1 < len(eligible_h):
+                eligible_h[heifer_active_hi + 1 :] = 0.0
 
             services_by_age = eligible_h * p_service_h
             services_total_h = float(services_by_age.sum())
@@ -2055,18 +2468,73 @@ def simulate_to_target(
                     state.heifer_age = np.maximum(0.0, state.heifer_age - conceived_by_age)
                     state.heifer_preg["sex"][gest_days] += services_total_h * heif_sex_share * p_conc_h
                     state.heifer_preg["trad"][gest_days] += services_total_h * heif_trad_share * p_conc_h
+                    meta["flow_h9_to_neteli"] += conceived_total_h
 
                 if (int(day.year), int(day.month)) == target_month:
                     meta["heifer_doses_total"] += services_total_h
                     meta["heifer_doses_sex"] += services_total_h * heif_sex_share
                     meta["heifer_doses_trad"] += services_total_h * heif_trad_share
 
+        heifer_disp_base = max(0.0, min(0.02, float(p_disp_day_heifer)))
+        if heifer_disp_base > 0.0:
+            if len(state.heifer_age) > 270:
+                h9_before = state.heifer_age[270:].copy()
+                state.heifer_age[270:] = h9_before * (1.0 - heifer_disp_base)
+                meta["disp_h9_total"] += float((h9_before - state.heifer_age[270:]).sum())
+            for semen in ("trad", "sex"):
+                neteli_before = state.heifer_preg[semen].copy()
+                state.heifer_preg[semen] = neteli_before * (1.0 - heifer_disp_base)
+                meta["disp_neteli_total"] += float((neteli_before - state.heifer_preg[semen]).sum())
+
+        bull_disp_base = max(0.0, min(0.8, float(bull_calf_exit)))
+        if bull_disp_base > 0.0 and len(state.bull_age) > 0:
+            bull_before = state.bull_age[:61].copy()
+            state.bull_age[:61] = bull_before * (1.0 - bull_disp_base)
+            meta["flow_b0_to_out"] += float((bull_before - state.bull_age[:61]).sum())
+
+        if p_preg_loss_day_cow > 0.0:
+            for l in (1, 2, 3, 4):
+                mean_conc = float(cp["avg_cow_dim_by_lact"].get(l, cp["avg_cow_dim_global"]))
+                conc0 = int(round(mean_conc))
+                idx = np.arange(gest_days + 1, dtype=int)
+                gest_age = (gest_days - idx).astype(int)
+                est_dim = np.clip(conc0 + gest_age, 0, MAX_DIM).astype(int)
+                for semen in ("trad", "sex"):
+                    preg_l_before = state.preg_lact[(l, semen)].copy()
+                    preg_d_before = state.preg_dry[(l, semen)].copy()
+                    lost_l = preg_l_before * p_preg_loss_day_cow
+                    lost_d = preg_d_before * p_preg_loss_day_cow
+                    if float(lost_l.sum()) > 0.0:
+                        state.preg_lact[(l, semen)] = preg_l_before - lost_l
+                        np.add.at(state.open_dim[l], est_dim, lost_l)
+                        meta["preg_loss_cows_total"] += float(lost_l.sum())
+                    if float(lost_d.sum()) > 0.0:
+                        state.preg_dry[(l, semen)] = preg_d_before - lost_d
+                        np.add.at(state.open_dim[l], est_dim, lost_d)
+                        meta["preg_loss_cows_total"] += float(lost_d.sum())
+
+        if p_preg_loss_day_heifer > 0.0:
+            base_heifer_age = int(round(float(cp["avg_heifer_age_days"])))
+            idx = np.arange(gest_days + 1, dtype=int)
+            gest_age = (gest_days - idx).astype(int)
+            est_age = np.clip(base_heifer_age + gest_age, 0, MAX_AGE_DAYS).astype(int)
+            for semen in ("trad", "sex"):
+                preg_h_before = state.heifer_preg[semen].copy()
+                lost_h = preg_h_before * p_preg_loss_day_heifer
+                if float(lost_h.sum()) <= 0.0:
+                    continue
+                state.heifer_preg[semen] = preg_h_before - lost_h
+                np.add.at(state.heifer_age, est_age, lost_h)
+                meta["preg_loss_heifers_total"] += float(lost_h.sum())
+
         for l in (1, 2, 3, 4):
             base = float(p_disp_day_base * w[l])
             base = max(0.0, min(0.02, base))
 
             haz_open = np.clip(base * disp_shape[l], 0.0, 0.05)
-            state.open_dim[l] *= (1.0 - haz_open)
+            open_before = state.open_dim[l].copy()
+            state.open_dim[l] = open_before * (1.0 - haz_open)
+            meta["disp_doy_total"] += float((open_before - state.open_dim[l]).sum())
 
             mean_conc = float(cp["avg_cow_dim_by_lact"].get(l, cp["avg_cow_dim_global"]))
             conc0 = int(round(mean_conc))
@@ -2076,8 +2544,12 @@ def simulate_to_target(
 
             haz_preg = np.clip(base * disp_shape[l][est_dim], 0.0, 0.05)
             for semen in ("trad", "sex"):
-                state.preg_lact[(l, semen)] *= (1.0 - haz_preg)
-                state.preg_dry[(l, semen)] *= (1.0 - haz_preg)
+                preg_l_before = state.preg_lact[(l, semen)].copy()
+                preg_d_before = state.preg_dry[(l, semen)].copy()
+                state.preg_lact[(l, semen)] = preg_l_before * (1.0 - haz_preg)
+                state.preg_dry[(l, semen)] = preg_d_before * (1.0 - haz_preg)
+                meta["disp_doy_total"] += float((preg_l_before - state.preg_lact[(l, semen)]).sum())
+                meta["disp_dry_total"] += float((preg_d_before - state.preg_dry[(l, semen)]).sum())
 
         day_eom = pd.Timestamp(end_of_month(day.date())).normalize()
         if params.get("APPLY_CAPACITY", True) and day == day_eom:
@@ -2097,6 +2569,14 @@ def simulate_to_target(
                 meta["over_h38"] += float(sold["over_h38"])
                 meta["over_h9"] += float(sold["over_h9"])
                 meta["over_neteli"] += float(sold["over_neteli"])
+            meta["sell_cows_total"] += float(sold.get("sell_cows", 0.0))
+            meta["sell_cows_doy_total"] += float(sold.get("sell_cows_doy", 0.0))
+            meta["sell_cows_dry_total"] += float(sold.get("sell_cows_dry", 0.0))
+            meta["sell_heifers_total"] += float(sold.get("sell_heifers", 0.0))
+            meta["sell_heifers_h0_total"] += float(sold.get("sell_heifers_h0", 0.0))
+            meta["sell_heifers_h38_total"] += float(sold.get("sell_heifers_h38", 0.0))
+            meta["sell_heifers_h9_total"] += float(sold.get("sell_heifers_h9", 0.0))
+            meta["sell_neteli_total"] += float(sold.get("sell_neteli", 0.0))
 
         if day == target_ts:
             snapshot = _copy_state(state)
@@ -2156,6 +2636,13 @@ def compute_forecast_dynamic_from_db(
         ov["DRY_DAYS"] = ov["dry_days"]
     if "annual_disposal_rate" in ov and "ANNUAL_DISPOSAL_RATE" not in ov:
         ov["ANNUAL_DISPOSAL_RATE"] = ov["annual_disposal_rate"]
+    if (
+        "heifer_precalving_annual_disposal_rate" in ov
+        and "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE" not in ov
+    ):
+        ov["HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE"] = ov["heifer_precalving_annual_disposal_rate"]
+    if "bull_calf_daily_exit_rate" in ov and "BULL_CALF_DAILY_EXIT_RATE" not in ov:
+        ov["BULL_CALF_DAILY_EXIT_RATE"] = ov["bull_calf_daily_exit_rate"]
     if "conception" in ov and "CONCEPTION_PARAMS" not in ov:
         ov["CONCEPTION_PARAMS"] = ov["conception"]
     if "insemination_params" in ov and "INSEMINATION_PARAMS" not in ov:
@@ -2354,6 +2841,156 @@ def _normalize_input_tables(tables: Dict[str, pd.DataFrame] | None) -> Dict[str,
         out[key] = dfx[cols].copy()
 
     return out
+
+
+def _as_normalized_ts(x: Any) -> pd.Timestamp | None:
+    if x is None:
+        return None
+    if isinstance(x, pd.Timestamp):
+        return x.normalize()
+    if isinstance(x, datetime):
+        return pd.Timestamp(x).normalize()
+    if isinstance(x, date):
+        return pd.Timestamp(x)
+    return pd.Timestamp(x).normalize()
+
+
+def _run_dynamic_simulation_from_tables(
+    tables: Dict[str, pd.DataFrame],
+    target_date: date,
+    overrides: dict | None = None,
+    as_of_date: date | None = None,
+) -> dict[str, Any]:
+    tables = _normalize_input_tables(tables)
+    base = _as_normalized_ts(latest_data_date(tables))
+    target_ts = _as_normalized_ts(target_date)
+
+    if as_of_date is None:
+        start = min(base, target_ts)
+    else:
+        as_of_ts = _as_normalized_ts(as_of_date)
+        if as_of_ts is None or pd.isna(as_of_ts):
+            raise ValueError(f"as_of_date is invalid: {as_of_date!r}")
+        start = min(min(as_of_ts, base), target_ts)
+
+    ov = dict(overrides or {})
+
+    if "gestation_days" in ov and "GESTATION_DAYS" not in ov:
+        ov["GESTATION_DAYS"] = ov["gestation_days"]
+    if "dry_days" in ov and "DRY_DAYS" not in ov:
+        ov["DRY_DAYS"] = ov["dry_days"]
+    if "annual_disposal_rate" in ov and "ANNUAL_DISPOSAL_RATE" not in ov:
+        ov["ANNUAL_DISPOSAL_RATE"] = ov["annual_disposal_rate"]
+    if (
+        "heifer_precalving_annual_disposal_rate" in ov
+        and "HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE" not in ov
+    ):
+        ov["HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE"] = ov["heifer_precalving_annual_disposal_rate"]
+    if "bull_calf_daily_exit_rate" in ov and "BULL_CALF_DAILY_EXIT_RATE" not in ov:
+        ov["BULL_CALF_DAILY_EXIT_RATE"] = ov["bull_calf_daily_exit_rate"]
+    if "conception" in ov and "CONCEPTION_PARAMS" not in ov:
+        ov["CONCEPTION_PARAMS"] = ov["conception"]
+    if "insemination_params" in ov and "INSEMINATION_PARAMS" not in ov:
+        ov["INSEMINATION_PARAMS"] = ov["insemination_params"]
+    if "semen_usage" in ov and "SEMEN_USAGE_SHARES" not in ov:
+        ov["SEMEN_USAGE_SHARES"] = ov["semen_usage"]
+    if "SEMEN_SEX_RATIOS" in ov and "semen_sex_ratios" not in ov:
+        ov["semen_sex_ratios"] = ov["SEMEN_SEX_RATIOS"]
+    if "herd_capacity" in ov and "HERD_CAPACITY" not in ov:
+        ov["HERD_CAPACITY"] = ov["herd_capacity"]
+
+    params = _resolve_runtime_params(ov)
+    gest_days = int(params["GESTATION_DAYS"])
+    dry_days = int(params["DRY_DAYS"])
+
+    semen_override = params.get("SEMEN_USAGE_SHARES")
+    if isinstance(semen_override, dict) and semen_override:
+        semen_shares = {
+            "cow_trad": float(semen_override.get("cow_trad", 0.0)),
+            "cow_sex": float(semen_override.get("cow_sex", 0.0)),
+            "heifer_trad": float(semen_override.get("heifer_trad", 0.0)),
+            "heifer_sex": float(semen_override.get("heifer_sex", 0.0)),
+        }
+
+        def _norm2(a: float, b: float) -> tuple[float, float]:
+            s = max(1e-9, a + b)
+            return a / s, b / s
+
+        semen_shares["cow_trad"], semen_shares["cow_sex"] = _norm2(semen_shares["cow_trad"], semen_shares["cow_sex"])
+        semen_shares["heifer_trad"], semen_shares["heifer_sex"] = _norm2(semen_shares["heifer_trad"], semen_shares["heifer_sex"])
+    else:
+        semen_shares = compute_semen_usage_from_db(tables)
+
+    ssr_ov = ov.get("semen_sex_ratios")
+    if isinstance(ssr_ov, dict) and ssr_ov:
+        trad = ssr_ov.get("trad", {}) or {}
+        sex = ssr_ov.get("sex", {}) or {}
+
+        def _mk_ratio(d: dict, fallback_obj: SemenSexRatio) -> SemenSexRatio:
+            bull_raw = d.get("bull_share")
+            heif_raw = d.get("heifer_share")
+
+            if bull_raw is None and heif_raw is None:
+                bull = float(fallback_obj.bull_share)
+                heif = float(fallback_obj.heifer_share)
+            elif bull_raw is None:
+                heif = float(heif_raw)
+                bull = 1.0 - heif
+            elif heif_raw is None:
+                bull = float(bull_raw)
+                heif = 1.0 - bull
+            else:
+                bull = float(bull_raw)
+                heif = float(heif_raw)
+
+            bull = max(0.0, min(1.0, bull))
+            heif = max(0.0, min(1.0, heif))
+            s = max(1e-9, bull + heif)
+            bull /= s
+            heif /= s
+            return SemenSexRatio(bull_share=bull, heifer_share=heif)
+
+        semen_sex_ratios = {
+            "trad": _mk_ratio(trad, _to_semen_ratio(SEMEN_SEX_RATIOS["trad"])),
+            "sex": _mk_ratio(sex, _to_semen_ratio(SEMEN_SEX_RATIOS["sex"])),
+        }
+    else:
+        semen_sex_ratios = compute_semen_sex_ratios_from_db(tables)
+
+    warmstart_from_services = bool(ov.get("warmstart_from_services", True))
+    state0 = build_initial_state(
+        tables,
+        as_of=start,
+        gest_days=gest_days,
+        dry_days=dry_days,
+        insemination_params=params["INSEMINATION_PARAMS"],
+        warmstart_from_services=warmstart_from_services,
+        semen_sex_ratios=semen_sex_ratios,
+    )
+    state0_initial = _copy_state(state0)
+    state_at_target, meta = simulate_to_target(
+        state0,
+        start=start,
+        target=target_ts,
+        semen_shares=semen_shares,
+        semen_sex_ratios=semen_sex_ratios,
+        params=params,
+    )
+    return {
+        "tables": tables,
+        "target_ts": target_ts,
+        "start": start,
+        "params": params,
+        "gest_days": gest_days,
+        "dry_days": dry_days,
+        "semen_shares": semen_shares,
+        "semen_sex_ratios": semen_sex_ratios,
+        "state0": state0_initial,
+        "state_at_target": state_at_target,
+        "meta": meta,
+        "overrides": ov,
+        "as_of_date": as_of_date,
+    }
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -2730,129 +3367,22 @@ def compute_forecast_dynamic_from_tables(
     overrides: dict | None = None,
     as_of_date: date | None = None,
 ) -> Dict[str, float]:
-    import pandas as pd
-    from datetime import date, datetime
-
-    def _as_ts(x):
-        if x is None:
-            return None
-        if isinstance(x, pd.Timestamp):
-            return x.normalize()
-        if isinstance(x, datetime):
-            return pd.Timestamp(x).normalize()
-        if isinstance(x, date):
-            return pd.Timestamp(x)
-        return pd.Timestamp(x).normalize()
-
-    tables = _normalize_input_tables(tables)
-    base = _as_ts(latest_data_date(tables))
-    target_date = _as_ts(target_date)
-
-    if as_of_date is None:
-        start = min(base, target_date)
-    else:
-        as_of_ts = _as_ts(as_of_date)
-        if as_of_ts is None or pd.isna(as_of_ts):
-            raise ValueError(f"as_of_date is invalid: {as_of_date!r}")
-        start = min(min(as_of_ts, base), target_date)
-
-    ov = dict(overrides or {})
-
-    if "gestation_days" in ov and "GESTATION_DAYS" not in ov:
-        ov["GESTATION_DAYS"] = ov["gestation_days"]
-    if "dry_days" in ov and "DRY_DAYS" not in ov:
-        ov["DRY_DAYS"] = ov["dry_days"]
-    if "annual_disposal_rate" in ov and "ANNUAL_DISPOSAL_RATE" not in ov:
-        ov["ANNUAL_DISPOSAL_RATE"] = ov["annual_disposal_rate"]
-    if "conception" in ov and "CONCEPTION_PARAMS" not in ov:
-        ov["CONCEPTION_PARAMS"] = ov["conception"]
-    if "insemination_params" in ov and "INSEMINATION_PARAMS" not in ov:
-        ov["INSEMINATION_PARAMS"] = ov["insemination_params"]
-    if "semen_usage" in ov and "SEMEN_USAGE_SHARES" not in ov:
-        ov["SEMEN_USAGE_SHARES"] = ov["semen_usage"]
-    if "SEMEN_SEX_RATIOS" in ov and "semen_sex_ratios" not in ov:
-        ov["semen_sex_ratios"] = ov["SEMEN_SEX_RATIOS"]
-    if "herd_capacity" in ov and "HERD_CAPACITY" not in ov:
-        ov["HERD_CAPACITY"] = ov["herd_capacity"]
-
-    params = _resolve_runtime_params(ov)
-    gest_days = int(params["GESTATION_DAYS"])
-    dry_days = int(params["DRY_DAYS"])
-
-    semen_override = params.get("SEMEN_USAGE_SHARES")
-    if isinstance(semen_override, dict) and semen_override:
-        semen_shares = {
-            "cow_trad": float(semen_override.get("cow_trad", 0.0)),
-            "cow_sex": float(semen_override.get("cow_sex", 0.0)),
-            "heifer_trad": float(semen_override.get("heifer_trad", 0.0)),
-            "heifer_sex": float(semen_override.get("heifer_sex", 0.0)),
-        }
-
-        def _norm2(a: float, b: float) -> tuple[float, float]:
-            s = max(1e-9, a + b)
-            return a / s, b / s
-
-        semen_shares["cow_trad"], semen_shares["cow_sex"] = _norm2(semen_shares["cow_trad"], semen_shares["cow_sex"])
-        semen_shares["heifer_trad"], semen_shares["heifer_sex"] = _norm2(semen_shares["heifer_trad"], semen_shares["heifer_sex"])
-    else:
-        semen_shares = compute_semen_usage_from_db(tables)
-
-    ssr_ov = ov.get("semen_sex_ratios")
-    if isinstance(ssr_ov, dict) and ssr_ov:
-        trad = ssr_ov.get("trad", {}) or {}
-        sex = ssr_ov.get("sex", {}) or {}
-
-        def _mk_ratio(d: dict, fallback_obj: SemenSexRatio) -> SemenSexRatio:
-            bull_raw = d.get("bull_share")
-            heif_raw = d.get("heifer_share")
-
-            if bull_raw is None and heif_raw is None:
-                bull = float(fallback_obj.bull_share)
-                heif = float(fallback_obj.heifer_share)
-            elif bull_raw is None:
-                heif = float(heif_raw)
-                bull = 1.0 - heif
-            elif heif_raw is None:
-                bull = float(bull_raw)
-                heif = 1.0 - bull
-            else:
-                bull = float(bull_raw)
-                heif = float(heif_raw)
-
-            bull = max(0.0, min(1.0, bull))
-            heif = max(0.0, min(1.0, heif))
-            s = max(1e-9, bull + heif)
-            bull /= s
-            heif /= s
-            return SemenSexRatio(bull_share=bull, heifer_share=heif)
-
-        semen_sex_ratios = {
-            "trad": _mk_ratio(trad, _to_semen_ratio(SEMEN_SEX_RATIOS["trad"])),
-            "sex": _mk_ratio(sex, _to_semen_ratio(SEMEN_SEX_RATIOS["sex"])),
-        }
-    else:
-        semen_sex_ratios = compute_semen_sex_ratios_from_db(tables)
-
-    warmstart_from_services = bool(ov.get("warmstart_from_services", True))
-
-    state0 = build_initial_state(
+    sim = _run_dynamic_simulation_from_tables(
         tables,
-        as_of=start,
-        gest_days=gest_days,
-        dry_days=dry_days,
-        insemination_params=params["INSEMINATION_PARAMS"],
-        warmstart_from_services=warmstart_from_services,
-        semen_sex_ratios=semen_sex_ratios,
+        target_date,
+        overrides=overrides,
+        as_of_date=as_of_date,
     )
-
-    state_at_target, meta = simulate_to_target(
-        state0,
-        start=start,
-        target=target_date,
-        semen_shares=semen_shares,
-        semen_sex_ratios=semen_sex_ratios,
-        params=params,
-    )
+    tables = sim["tables"]
+    target_date = sim["target_ts"]
+    start = sim["start"]
+    params = sim["params"]
+    gest_days = int(sim["gest_days"])
+    state_at_target = sim["state_at_target"]
+    meta = sim["meta"]
+    semen_shares = sim["semen_shares"]
+    semen_sex_ratios = sim["semen_sex_ratios"]
+    ov = sim["overrides"]
 
     cows_open = sum(state_at_target.open_dim[l].sum() for l in (1, 2, 3, 4))
     cows_preg_lact = sum(state_at_target.preg_lact[(l, s)].sum() for l in (1, 2, 3, 4) for s in ("trad", "sex"))
@@ -2929,3 +3459,90 @@ def compute_forecast_dynamic_from_tables(
         ),
     )
     return out
+
+
+def _metric_debug_breakdown_from_simulation(
+    metric_name: str,
+    *,
+    state0: HerdState,
+    state_at_target: HerdState,
+    meta: Mapping[str, Any],
+) -> Dict[str, float | None]:
+    meta_start_values = {
+        "Дойные коровы": float(meta.get("start_doy", np.nan)),
+        "Сухостойные коровы": float(meta.get("start_dry", np.nan)),
+        "Тёлки 0–3 мес": float(meta.get("start_h0", np.nan)),
+        "Бычки 0–2 мес": float(meta.get("start_b0", np.nan)),
+        "Тёлки 3–8 мес": float(meta.get("start_h38", np.nan)),
+        "Тёлки ≥9 мес": float(meta.get("start_h9", np.nan)),
+        "Нетели": float(meta.get("start_neteli", np.nan)),
+    }
+    start_snapshot = _state_group_snapshot(state0)
+    end_snapshot = _state_group_snapshot(state_at_target)
+
+    start_val = float(meta_start_values.get(metric_name, np.nan))
+    if np.isnan(start_val):
+        start_val = float(start_snapshot.get(metric_name, 0.0))
+    end_val = float(end_snapshot.get(metric_name, 0.0))
+    inflow = 0.0
+    transition_next = 0.0
+    other_outflow = 0.0
+
+    if metric_name == "Дойные коровы":
+        inflow = float(meta.get("flow_dry_to_doy", 0.0) or 0.0) + float(meta.get("flow_neteli_to_doy", 0.0) or 0.0)
+        transition_next = float(meta.get("flow_doy_to_dry", 0.0) or 0.0)
+        other_outflow = float(meta.get("disp_doy_total", 0.0) or 0.0) + float(meta.get("sell_cows_doy_total", 0.0) or 0.0)
+    elif metric_name == "Сухостойные коровы":
+        inflow = float(meta.get("flow_doy_to_dry", 0.0) or 0.0)
+        transition_next = float(meta.get("flow_dry_to_doy", 0.0) or 0.0)
+        other_outflow = float(meta.get("disp_dry_total", 0.0) or 0.0) + float(meta.get("sell_cows_dry_total", 0.0) or 0.0)
+    elif metric_name == "Нетели":
+        inflow = float(meta.get("flow_h9_to_neteli", 0.0) or 0.0)
+        transition_next = float(meta.get("flow_neteli_to_doy", 0.0) or 0.0)
+        other_outflow = float(meta.get("disp_neteli_total", 0.0) or 0.0) + float(meta.get("sell_neteli_total", 0.0) or 0.0)
+    elif metric_name == "Тёлки ≥9 мес":
+        inflow = float(meta.get("flow_h38_to_h9", 0.0) or 0.0)
+        transition_next = float(meta.get("flow_h9_to_neteli", 0.0) or 0.0)
+        other_outflow = float(meta.get("disp_h9_total", 0.0) or 0.0) + float(meta.get("sell_heifers_h9_total", 0.0) or 0.0)
+    elif metric_name == "Тёлки 3–8 мес":
+        inflow = float(meta.get("flow_h0_to_h38", 0.0) or 0.0)
+        transition_next = float(meta.get("flow_h38_to_h9", 0.0) or 0.0)
+        other_outflow = float(meta.get("sell_heifers_h38_total", 0.0) or 0.0)
+    elif metric_name in {"Тёлки 0–3 мес", "Тёлки 0–2 мес"}:
+        inflow = float(meta.get("flow_birth_female_total", 0.0) or 0.0)
+        transition_next = float(meta.get("flow_h0_to_h38", 0.0) or 0.0)
+        other_outflow = float(meta.get("sell_heifers_h0_total", 0.0) or 0.0)
+    elif metric_name == "Бычки 0–2 мес":
+        inflow = float(meta.get("flow_birth_male_total", 0.0) or 0.0)
+        transition_next = float(meta.get("flow_b0_to_out", 0.0) or 0.0)
+        other_outflow = 0.0
+
+    return {
+        "Старт группы": round(start_val, 1),
+        "Приток": round(float(inflow), 1),
+        "Переход в следующую группу": round(float(transition_next), 1),
+        "Прочее выбытие": round(float(other_outflow), 1),
+        "Выбытие всего": round(float(transition_next + other_outflow), 1),
+        "Финиш группы (симуляция)": round(end_val, 1),
+    }
+
+
+def compute_forecast_debug_from_tables(
+    tables: Dict[str, pd.DataFrame],
+    target_date: date,
+    metric_name: str,
+    overrides: dict | None = None,
+    as_of_date: date | None = None,
+) -> Dict[str, float | None]:
+    sim = _run_dynamic_simulation_from_tables(
+        tables,
+        target_date,
+        overrides=overrides,
+        as_of_date=as_of_date,
+    )
+    return _metric_debug_breakdown_from_simulation(
+        metric_name,
+        state0=sim["state0"],
+        state_at_target=sim["state_at_target"],
+        meta=sim["meta"],
+    )

@@ -3,6 +3,7 @@ import re
 from io import BytesIO
 from pathlib import Path
 
+from core.date_parse import parse_mixed_date
 from db import engine
 
                                           
@@ -184,7 +185,7 @@ def read_disposals_excel(path_or_buffer, include_meta: bool = False) -> pd.DataF
 
 def _parse_date_series(s: pd.Series) -> pd.Series:
     """Безопасно парсит даты, ошибки → NaT."""
-    return pd.to_datetime(s, errors="coerce", dayfirst=True).dt.date
+    return parse_mixed_date(s)
 
 
 def clean_disposals(df: pd.DataFrame) -> pd.DataFrame:

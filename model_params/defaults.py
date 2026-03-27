@@ -75,6 +75,8 @@ DISPOSAL_PARAMS: Dict[str, object] = {
 }
 
 ANNUAL_DISPOSAL_RATE: float = 0.0957
+HEIFER_PRECALVING_ANNUAL_DISPOSAL_RATE: float = ANNUAL_DISPOSAL_RATE
+BULL_CALF_DAILY_EXIT_RATE: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -82,9 +84,11 @@ class InseminationParams:
     cow_first_ai_dim_by_lact: Dict[int, float]
     cow_ai_interval_days: float
     cow_services_per_conception: float
+    cow_pregnancy_loss_rate: float
     heifer_first_ai_age_days: float
     heifer_ai_interval_days: float
     heifer_services_per_conception: float
+    heifer_pregnancy_loss_rate: float
     cow_conception_month_factors: Dict[int, float]
     heifer_conception_month_factors: Dict[int, float]
 
@@ -98,9 +102,11 @@ INSEMINATION_PARAMS = InseminationParams(
     },
     cow_ai_interval_days=46.78500715648855,
     cow_services_per_conception=2.0376243474835025,
+    cow_pregnancy_loss_rate=0.0,
     heifer_first_ai_age_days=378.5310701203558,
     heifer_ai_interval_days=25.258195726080622,
     heifer_services_per_conception=1.9456635318704285,
+    heifer_pregnancy_loss_rate=0.0,
     cow_conception_month_factors={m: 1.0 for m in range(1, 13)},
     heifer_conception_month_factors={m: 1.0 for m in range(1, 13)},
 )

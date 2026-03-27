@@ -8,13 +8,21 @@ from typing import Any, Callable, Optional
 
 import pandas as pd
 
-from core.calving_facts import actual_birth_stats_from_tables, is_calving_month_complete_from_tables
+from core.backtesting import (
+    actual_birth_stats_month_from_tables,
+    actual_metric_month_from_tables,
+    backtest_percent_error,
+    collect_recent_target_months,
+    month_end_shift,
+    pred_metric_value,
+    target_fact_month_complete_from_tables,
+)
 from core.constants import INDICATORS, OVERFLOW_COLS
 from core.helpers import iter_month_ends, month_end, norm_label, vals_get
 from forecast_dynamic import compute_forecast_dynamic_from_tables, latest_data_date
 
-from .common import FARM_BACKTEST_BIRTH_TARGETS, FARM_BACKTEST_TARGETS, FARM_PERCENT_TARGETS, _norm_event_type, _norm_id
-from .storage import _load_farm_tables_from_db, _norm_reg_value, _subdivisions_for_farm
+from .common import FARM_BACKTEST_BIRTH_TARGETS, FARM_BACKTEST_TARGETS, FARM_PERCENT_TARGETS
+from .storage import _load_cow_capacity_by_subdivision, _load_farm_tables_from_db, _norm_reg_value, _subdivisions_for_farm
 
 _FARM_SANITY_KEYS = [
     "Дойные коровы",
@@ -39,199 +47,8 @@ _TRANSFER_GROUPS_ALL = [
 ]
 
 
-def backtest_percent_error(pred_val: float, fact_val: float, *, is_pct: bool) -> float | None:
-    err_abs = abs(float(pred_val) - float(fact_val))
-    if is_pct:
-        return (err_abs / abs(float(fact_val)) * 100.0) if abs(float(fact_val)) > 1e-9 else None
-    scale = abs(float(pred_val)) + abs(float(fact_val))
-    if scale < 20.0:
-        return None
-    return 200.0 * err_abs / scale
-
-
 def _month_label(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
-
-def _month_end_shift(d_end: date, months_delta: int) -> date:
-    ts = pd.Timestamp(d_end) + pd.DateOffset(months=months_delta)
-    return month_end(int(ts.year), int(ts.month))
-
-def _norm_sex_marker_backtest(x: Any) -> str | None:
-    if x is None:
-        return None
-    v = str(x).strip().upper().replace("Ё", "Е")
-    if v in {"", "NAN", "NONE", "NULL"}:
-        return None
-    if v in {"M", "М", "MALE", "1", "БЫК", "БЫЧ", "БЫЧОК"}:
-        return "M"
-    if v in {"F", "Ж", "FEMALE", "2", "ТЕЛКА", "ТЕЛОЧКА"}:
-        return "F"
-    return None
-
-def _actual_birth_stats_month_from_tables(
-    calv_df: pd.DataFrame,
-    ins_df: pd.DataFrame,
-    month_end_date: date,
-    as_of_date: date | None = None,
-) -> dict[str, float]:
-    return actual_birth_stats_from_tables(calv_df, ins_df, month_end_date, as_of_date=as_of_date)
-
-
-def _actual_nonbirth_snapshot_from_tables(
-    calv_df: pd.DataFrame,
-    ins_df: pd.DataFrame,
-    dry_df: pd.DataFrame,
-    disp_df: pd.DataFrame,
-    as_of_date: date,
-) -> dict[str, float]:
-    out = {
-        "Дойные коровы": 0.0,
-        "Сухостойные коровы": 0.0,
-        "Тёлки 0–3 мес": 0.0,
-        "Бычки 0–2 мес": 0.0,
-        "Тёлки 3–8 мес": 0.0,
-        "Тёлки ≥9 мес": 0.0,
-        "Нетели": 0.0,
-    }
-    as_of_ts = pd.Timestamp(as_of_date).normalize()
-
-    disp = disp_df.copy() if isinstance(disp_df, pd.DataFrame) else pd.DataFrame()
-    if not disp.empty:
-        disp["event_date_n"] = pd.to_datetime(disp.get("event_date"), errors="coerce").dt.normalize()
-        disp["reg_s"] = disp.get("reg", pd.Series(dtype=object)).map(_norm_id)
-        disp = disp[(disp["event_date_n"].notna()) & (disp["event_date_n"] <= as_of_ts) & (disp["reg_s"] != "")]
-    disposed: set[str] = set(disp["reg_s"].astype(str).tolist()) if not disp.empty else set()
-
-    ins = ins_df.copy() if isinstance(ins_df, pd.DataFrame) else pd.DataFrame()
-    if not ins.empty:
-        ins["event_date_n"] = pd.to_datetime(ins.get("event_date"), errors="coerce").dt.normalize()
-        ins["reg_s"] = ins.get("reg", pd.Series(dtype=object)).map(_norm_id)
-        ins["lact_n"] = pd.to_numeric(ins.get("lact"), errors="coerce")
-        ins = ins[(ins["event_date_n"].notna()) & (ins["event_date_n"] <= as_of_ts) & (ins["reg_s"] != "")]
-    cows_from_ins = set(ins.loc[ins["lact_n"] > 0, "reg_s"].astype(str).tolist()) if not ins.empty else set()
-    neteli_from_ins = set(ins.loc[ins["lact_n"] <= 0, "reg_s"].astype(str).tolist()) if not ins.empty else set()
-
-    dry = dry_df.copy() if isinstance(dry_df, pd.DataFrame) else pd.DataFrame()
-    if not dry.empty:
-        dry["event_date_n"] = pd.to_datetime(dry.get("event_date"), errors="coerce").dt.normalize()
-        dry["reg_s"] = dry.get("reg", pd.Series(dtype=object)).map(_norm_id)
-        dry = dry[(dry["event_date_n"].notna()) & (dry["event_date_n"] <= as_of_ts) & (dry["reg_s"] != "")]
-    if not dry.empty:
-        last_dry = (
-            dry.sort_values(["reg_s", "event_date_n"], kind="mergesort")
-            .drop_duplicates(subset=["reg_s"], keep="last")
-            .set_index("reg_s")["event_date_n"]
-            .to_dict()
-        )
-    else:
-        last_dry = {}
-
-    calv = calv_df.copy() if isinstance(calv_df, pd.DataFrame) else pd.DataFrame()
-    if not calv.empty:
-        calv["event_date_n"] = pd.to_datetime(calv.get("event_date"), errors="coerce").dt.normalize()
-        calv["birth_date_n"] = pd.to_datetime(calv.get("birth_date"), errors="coerce").dt.normalize()
-        calv["event_type_n"] = calv.get("event_type", pd.Series(dtype=object)).map(_norm_event_type)
-        calv["reg_s"] = calv.get("reg", pd.Series(dtype=object)).map(_norm_id)
-        calv["mother_reg_s"] = calv.get("mother_reg", pd.Series(dtype=object)).map(_norm_id)
-        calv["sex_norm"] = calv.get("sex", pd.Series(dtype=object)).map(_norm_sex_marker_backtest)
-        calv = calv[(calv["event_date_n"].notna()) & (calv["event_date_n"] <= as_of_ts)]
-        born = calv.loc[calv["event_type_n"] == "РОЖДЕН"].copy()
-    else:
-        born = pd.DataFrame()
-
-    if not born.empty:
-        born["birth_dt_n"] = born["birth_date_n"].where(born["birth_date_n"].notna(), born["event_date_n"])
-    else:
-        born["birth_dt_n"] = pd.NaT
-
-    mother_with_calv = set(born.loc[born["mother_reg_s"] != "", "mother_reg_s"].astype(str).tolist()) if not born.empty else set()
-    if not born.empty:
-        last_calv_by_mother = (
-            born.loc[born["mother_reg_s"] != "", ["mother_reg_s", "event_date_n"]]
-            .sort_values(["mother_reg_s", "event_date_n"], kind="mergesort")
-            .drop_duplicates(subset=["mother_reg_s"], keep="last")
-            .set_index("mother_reg_s")["event_date_n"]
-            .to_dict()
-        )
-    else:
-        last_calv_by_mother = {}
-
-    cow_candidates = set()
-    cow_candidates |= cows_from_ins
-    cow_candidates |= set(last_dry.keys())
-    cow_candidates |= mother_with_calv
-    cows_alive = {reg for reg in cow_candidates if reg and reg not in disposed}
-
-    dry_count = 0
-    for reg in cows_alive:
-        dry_dt = last_dry.get(reg)
-        if dry_dt is None or pd.isna(dry_dt):
-            continue
-        calv_dt = last_calv_by_mother.get(reg)
-        if calv_dt is None or pd.isna(calv_dt):
-            dry_count += 1
-        elif pd.Timestamp(dry_dt) > pd.Timestamp(calv_dt):
-            dry_count += 1
-    doy_count = max(0, len(cows_alive) - dry_count)
-
-    neteli_alive = {
-        reg for reg in neteli_from_ins
-        if reg and reg not in disposed and reg not in cows_alive and reg not in mother_with_calv
-    }
-
-    calf_excluded = set(cows_alive) | set(neteli_alive)
-    if not born.empty:
-        calves_f = born.loc[(born["sex_norm"] == "F") & (born["reg_s"] != ""), ["reg_s", "birth_dt_n"]].copy()
-        calves_m = born.loc[(born["sex_norm"] == "M") & (born["reg_s"] != ""), ["reg_s", "birth_dt_n"]].copy()
-    else:
-        calves_f = pd.DataFrame(columns=["reg_s", "birth_dt_n"])
-        calves_m = pd.DataFrame(columns=["reg_s", "birth_dt_n"])
-
-    def _count_by_age(df: pd.DataFrame) -> pd.Series:
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return pd.Series(dtype=float)
-        work = df.copy()
-        work = work[work["birth_dt_n"].notna()].copy()
-        if work.empty:
-            return pd.Series(dtype=float)
-        work = work[~work["reg_s"].astype(str).isin(disposed)]
-        work = work[~work["reg_s"].astype(str).isin(calf_excluded)]
-        if work.empty:
-            return pd.Series(dtype=float)
-        age_days = (as_of_ts - pd.to_datetime(work["birth_dt_n"], errors="coerce")).dt.days
-        return age_days
-
-    age_f = _count_by_age(calves_f)
-    age_m = _count_by_age(calves_m)
-
-    h0_3 = float(((age_f >= 0) & (age_f < 90)).sum()) if not age_f.empty else 0.0
-    h3_8 = float(((age_f >= 90) & (age_f < 270)).sum()) if not age_f.empty else 0.0
-    h9p = float((age_f >= 270).sum()) if not age_f.empty else 0.0
-    b0_2 = float(((age_m >= 0) & (age_m < 61)).sum()) if not age_m.empty else 0.0
-
-    out["Дойные коровы"] = float(doy_count)
-    out["Сухостойные коровы"] = float(dry_count)
-    out["Нетели"] = float(len(neteli_alive))
-    out["Тёлки 0–3 мес"] = h0_3
-    out["Бычки 0–2 мес"] = b0_2
-    out["Тёлки 3–8 мес"] = h3_8
-    out["Тёлки ≥9 мес"] = h9p
-    return out
-
-def _is_fact_month_complete_for_subdivision(calv_df: pd.DataFrame, month_end_date: date) -> bool:
-    return is_calving_month_complete_from_tables(calv_df, month_end_date)
-
-def _pred_metric_value_for_backtest(pred_vals: dict, metric_name: str, nmap: dict[str, float]) -> float:
-    if metric_name in FARM_PERCENT_TARGETS:
-        pred_bull = float(vals_get(pred_vals, "Ожидаемые бычки", nmap) or 0.0)
-        pred_heif = float(vals_get(pred_vals, "Ожидаемые тёлочки", nmap) or 0.0)
-        den = pred_bull + pred_heif
-        if den <= 0:
-            return 0.0
-        if metric_name == "Доля бычков среди рождений, %":
-            return pred_bull / den * 100.0
-        return pred_heif / den * 100.0
-    return float(vals_get(pred_vals, metric_name, nmap) or 0.0)
 
 def _run_farm_backtesting(
     farm_name: str,
@@ -248,13 +65,11 @@ def _run_farm_backtesting(
         return pd.DataFrame(), pd.DataFrame(), {"reason": "no_ready_subdivisions"}
 
     tables_by_sub: dict[str, dict[str, pd.DataFrame]] = {}
-    latest_by_sub: dict[str, date] = {}
     base_dates: list[date] = []
     for sub in subdivisions:
         tables = _load_farm_tables_from_db(sub)
         tables_by_sub[sub] = tables
         latest_dt = latest_data_date(tables)
-        latest_by_sub[sub] = latest_dt
         base_dates.append(latest_dt)
 
     if not base_dates:
@@ -262,7 +77,28 @@ def _run_farm_backtesting(
 
     base_date_bt = max(base_dates)
     last_me_bt = month_end(base_date_bt.year, base_date_bt.month)
-    target_months = [_month_end_shift(last_me_bt, -i) for i in range(bt_months - 1, -1, -1)]
+    if complete_only:
+        def _farm_month_has_complete_fact(d: date) -> bool:
+            for sub in subdivisions:
+                tables = tables_by_sub[sub]
+                if target_fact_month_complete_from_tables(
+                    tables,
+                    metric_name,
+                    d,
+                    birth_targets=FARM_BACKTEST_BIRTH_TARGETS,
+                    percent_targets=FARM_PERCENT_TARGETS,
+                ):
+                    return True
+            return False
+
+        target_months = collect_recent_target_months(
+            last_me_bt,
+            bt_months,
+            complete_checker=_farm_month_has_complete_fact,
+            search_limit_months=max(24, int(bt_months) * 12),
+        )
+    else:
+        target_months = [month_end_shift(last_me_bt, -i) for i in range(bt_months - 1, -1, -1)]
 
     farm_rows: list[dict[str, Any]] = []
     sub_rows: list[dict[str, Any]] = []
@@ -273,7 +109,7 @@ def _run_farm_backtesting(
     skipped_sub_months = 0
 
     for target_me in target_months:
-        as_of_me = _month_end_shift(target_me, -int(bt_horizon))
+        as_of_me = month_end_shift(target_me, -int(bt_horizon))
 
         month_pred = 0.0
         month_fact = 0.0
@@ -293,10 +129,13 @@ def _run_farm_backtesting(
             ins_df = tables.get("ins", pd.DataFrame())
             dry_df = tables.get("dry", pd.DataFrame())
             disp_df = tables.get("disp", pd.DataFrame())
-            if metric_name in FARM_BACKTEST_BIRTH_TARGETS or metric_name in FARM_PERCENT_TARGETS:
-                is_complete = _is_fact_month_complete_for_subdivision(calv_df, target_me)
-            else:
-                is_complete = bool(latest_by_sub.get(sub, date.min) >= target_me)
+            is_complete = target_fact_month_complete_from_tables(
+                tables,
+                metric_name,
+                target_me,
+                birth_targets=FARM_BACKTEST_BIRTH_TARGETS,
+                percent_targets=FARM_PERCENT_TARGETS,
+            )
             if complete_only and not is_complete:
                 skipped_sub_months += 1
                 continue
@@ -307,27 +146,36 @@ def _run_farm_backtesting(
                 if not isinstance(cand, dict) or not cand:
                     raise ValueError(f"{sub}: не получены параметры подразделения.")
                 sub_params = cand
+            pred_params = dict(sub_params)
+            pred_params["DISABLE_CAPACITY"] = True
 
             pred_vals = compute_forecast_dynamic_from_tables(
                 tables,
                 target_me,
-                overrides=sub_params,
+                overrides=pred_params,
                 as_of_date=as_of_me,
             ) or {}
             nmap = {norm_label(k): v for k, v in pred_vals.items()}
-            pred_val = float(_pred_metric_value_for_backtest(pred_vals, metric_name, nmap))
-            fact_stats = _actual_birth_stats_month_from_tables(calv_df, ins_df, target_me, as_of_date=None)
-            fact_nonbirth = _actual_nonbirth_snapshot_from_tables(
+            pred_val = float(
+                pred_metric_value(
+                    pred_vals,
+                    metric_name,
+                    nmap,
+                    percent_targets=FARM_PERCENT_TARGETS,
+                )
+            )
+            fact_stats = actual_birth_stats_month_from_tables(calv_df, ins_df, target_me, as_of_date=None)
+            fact_val = actual_metric_month_from_tables(
                 calv_df=calv_df,
                 ins_df=ins_df,
                 dry_df=dry_df,
                 disp_df=disp_df,
-                as_of_date=target_me,
+                month_end_date=target_me,
+                metric_name=metric_name,
+                birth_targets=FARM_BACKTEST_BIRTH_TARGETS,
+                percent_targets=FARM_PERCENT_TARGETS,
             )
-            if metric_name in FARM_BACKTEST_BIRTH_TARGETS or metric_name in FARM_PERCENT_TARGETS:
-                fact_val = float(fact_stats.get(metric_name, 0.0))
-            else:
-                fact_val = float(fact_nonbirth.get(metric_name, 0.0))
+            fact_val = float(fact_val)
 
             pred_bulls = float(vals_get(pred_vals, "Ожидаемые бычки", nmap) or 0.0)
             pred_heifers = float(vals_get(pred_vals, "Ожидаемые тёлочки", nmap) or 0.0)
@@ -986,21 +834,6 @@ def _split_transfer_by_cow_groups(move_total: float, src_groups: dict[str, float
     return rows
 
 
-def _demo_capacity_by_subdivision(subs: list[str], total_cows: float, shares: dict[str, float]) -> dict[str, float]:
-    if not subs:
-        return {}
-    ordered = sorted(str(x) for x in subs)
-    eq_share = 1.0 / max(1, len(ordered))
-    center = (len(ordered) - 1) / 2.0
-    raw: dict[str, float] = {}
-    for idx, sub in enumerate(ordered):
-        base_share = 0.65 * float(shares.get(sub, eq_share) or eq_share) + 0.35 * eq_share
-        offset = 0.0 if center <= 0 else (float(idx) - center) / center
-        mult = 1.0 + 0.12 * offset
-        raw[sub] = max(1e-6, base_share * mult)
-    scale = float(total_cows) / max(1e-6, sum(raw.values()))
-    return {sub: float(raw[sub] * scale) for sub in ordered}
-
 def _build_transfer_recommendations(
     farm_name: str,
     target_month_end: date,
@@ -1025,6 +858,13 @@ def _build_transfer_recommendations(
     months = sorted(set(monthly_base["Месяц"].astype(str).tolist()))
     if not subs or not months:
         return pd.DataFrame(), flows, pd.DataFrame(), pd.DataFrame(), {"reason": "no_subdivisions"}
+
+    cap_raw = _load_cow_capacity_by_subdivision(farm_name)
+    if not cap_raw:
+        return pd.DataFrame(), flows, pd.DataFrame(), pd.DataFrame(), {"reason": "no_capacity"}
+    cap_by_sub = {sub: max(0.0, float(cap_raw.get(sub, 0.0) or 0.0)) for sub in subs}
+    if max(cap_by_sub.values(), default=0.0) <= 1e-9:
+        return pd.DataFrame(), flows, pd.DataFrame(), pd.DataFrame(), {"reason": "no_capacity"}
 
     base_pivot = monthly_base.pivot_table(
         index="Месяц",
@@ -1084,12 +924,8 @@ def _build_transfer_recommendations(
                 "Сухостойные коровы": max(0.0, dry_now),
             }
 
-        total_cows = float(sum(cows_before.values()))
-        cap_est_by_sub = {sub: float(shares.get(sub, 0.0)) * total_cows for sub in subs}
-        cap_by_sub = _demo_capacity_by_subdivision(subs, total_cows, shares)
         overflow_before = {sub: max(0.0, cows_before[sub] - cap_by_sub[sub]) for sub in subs}
         free_before = {sub: max(0.0, cap_by_sub[sub] - cows_before[sub]) for sub in subs}
-        free_before_est = dict(free_before)
 
         free_left = dict(free_before)
         cows_after = dict(cows_before)
@@ -1157,13 +993,11 @@ def _build_transfer_recommendations(
                         "Источник (переполнен)": src,
                         "Куда перевести": dst,
                         "Рекомендовано перевести, голов": float(move_n),
-                        "Свободно в приёмнике, мест (оценка)": float(can_take),
                         "Свободно в приёмнике, мест": float(can_take),
                         "По группам (гол.)": groups_text,
                         "Детализация по группам": move_groups,
                     }
                 )
-                rec_rows[-1]["Свободно в приёмнике, мест (оценка)"] = float(free_before_est.get(dst, 0.0))
 
         overflow_after = {sub: max(0.0, cows_after[sub] - cap_by_sub[sub]) for sub in subs}
         free_after = {sub: max(0.0, cap_by_sub[sub] - cows_after[sub]) for sub in subs}
@@ -1179,7 +1013,6 @@ def _build_transfer_recommendations(
                     "Коровы всего (прогноз)": float(base_by_sub[sub]),
                     "Коровы до переводов": float(cows_before[sub]),
                     "Мест (коровы)": float(cap_by_sub[sub]),
-                    "Оценка мест (коровы)": float(cap_est_by_sub[sub]),
                     "Переполнение до перевода": float(overflow_before[sub]),
                     "Свободно мест до перевода": float(free_before[sub]),
                     "Переведено из подразделения": float(moved_out[sub]),
@@ -1188,7 +1021,7 @@ def _build_transfer_recommendations(
                     "Переполнение после перевода": float(overflow_after[sub]),
                     "Свободно мест после перевода": float(free_after[sub]),
                     "Корректировка переводами, накопленная": float(cows_after[sub] - base_by_sub[sub]),
-                    "Источник мест": "расчёт",
+                    "Источник мест": "БД",
                 }
             )
 
@@ -1212,8 +1045,8 @@ def _build_transfer_recommendations(
         snap_final = snap_final.rename(
             columns={
                 "Коровы после переводов": "Коровы всего",
-                "Переполнение после перевода": "Переполнение (оценка)",
-                "Свободно мест после перевода": "Свободно мест (оценка)",
+                "Переполнение после перевода": "Переполнение",
+                "Свободно мест после перевода": "Свободно мест",
             }
         )
 
@@ -1221,8 +1054,8 @@ def _build_transfer_recommendations(
     src_monthly_n = int(len(snap_monthly_df.loc[pd.to_numeric(snap_monthly_df.get("Переполнение до перевода"), errors="coerce").fillna(0.0) > 1e-6, ["Месяц", "Подразделение"]].drop_duplicates())) if not snap_monthly_df.empty else 0
     dst_monthly_n = int(len(snap_monthly_df.loc[pd.to_numeric(snap_monthly_df.get("Свободно мест до перевода"), errors="coerce").fillna(0.0) > 1e-6, ["Месяц", "Подразделение"]].drop_duplicates())) if not snap_monthly_df.empty else 0
     meta = {
-        "method": "calculated_capacity_plus_carx_flows",
-        "capacity_mode": "calculated_capacity",
+        "method": "db_capacity_plus_carx_flows",
+        "capacity_mode": "db_capacity",
         "month_from": str(months[0]) if months else None,
         "month_to": str(months[-1]) if months else None,
         "months_n": int(len(months)),
